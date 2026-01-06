@@ -43,6 +43,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# UV files
+*uv.lock
+
 # Temporary files
 *.tmp
 *.temp

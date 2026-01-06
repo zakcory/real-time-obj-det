@@ -3,7 +3,7 @@ FROM redhat/ubi8:latest
 # Install only the minimal dependencies needed
 RUN dnf update -y && \
     dnf install -y \
-        perl-FindBin \
+        # perl-FindBin \
         clang \
         clang-devel \
         llvm-devel \

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 // Custom modules
 use crate::inference::InferenceModel;
-use crate::source::FrameProcessStats;
+use crate::statistics::FrameProcessStats;
 use crate::processing::{self, RawFrame, ResultBBOX};
 use crate::utils::config::SourceConfig;
 use crate::utils::config::InferencePrecision;

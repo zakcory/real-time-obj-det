@@ -2,10 +2,10 @@ use anyhow::{Result, Context};
 use libloading::{Library, Symbol};
 use libc::{c_int, c_ulonglong, c_char, c_void};
 use std::slice;
-use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use serde_json::json;
 use std::ffi::CString;
+use std::sync::OnceLock;
 
 // Custom modules
 use crate::source;
@@ -13,15 +13,23 @@ use crate::utils::config::AppConfig;
 use crate::processing::{RawFrame, ResultBBOX};
 
 /// Client as static global variable
-pub static CLIENT_VIDEO: OnceCell<Arc<ClientVideo>> = OnceCell::new();
+pub static CLIENT_VIDEO: OnceLock<Arc<ClientVideo>> = OnceLock::new();
 
-pub fn get_client_video() -> Result<&'static Arc<ClientVideo>> {
-    CLIENT_VIDEO.get_or_try_init(|| {
-        let client_video = ClientVideo::new()
-            .context("Error creating client video")?;
-        
-        Ok(Arc::new(client_video))
-    })
+pub fn get_client_video() -> Result<Arc<ClientVideo>> {
+    let client_video = CLIENT_VIDEO.get()
+        .context("Error creating client video")?;
+
+    Ok(Arc::clone(client_video))
+}
+
+pub fn init_client_video() -> Result<()> {
+    let client_video = ClientVideo::new()
+        .context("Error creating client video")?;
+
+    CLIENT_VIDEO.set(Arc::new(client_video))
+        .map_err(|_| anyhow::anyhow!("Error setting up client video"))?;
+
+    Ok(())
 }
 
 // C Types
@@ -74,8 +82,24 @@ impl ClientVideo {
         )
     }
 
+    pub async fn init_sources(app_config: &AppConfig) -> Result<()> {
+        // Set callbacks
+        ClientVideo::set_callbacks().await
+            .context("Error setting Client Video callbacks")?;
+
+        // Start sources
+        let source_ids: Vec<c_int> = app_config.sources_config().sources
+            .keys()
+            .filter_map(|k| k.parse::<c_int>().ok())
+            .collect();
+        ClientVideo::start_sources(source_ids).await
+            .context("Error starting Client Video sources")?;
+        
+        Ok(())
+    }
+
     // Library function
-    pub async fn set_callbacks() -> Result<()> {
+    async fn set_callbacks() -> Result<()> {
         let client_video = get_client_video()?;
 
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -101,14 +125,8 @@ impl ClientVideo {
         Ok(())
     }
 
-    pub async fn init_sources(app_config: &AppConfig) -> Result<()> {
+    async fn start_sources(source_ids: Vec<c_int>) -> Result<()> {
         let client_video = get_client_video()?;
-
-        // Get sources ids
-        let source_ids: Vec<c_int> = app_config.sources_config().sources
-            .keys()
-            .filter_map(|k| k.parse::<c_int>().ok())
-            .collect();
 
         if source_ids.len() == 0 {
             anyhow::bail!("No valid sources are avaliable");
@@ -136,7 +154,7 @@ impl ClientVideo {
         Ok(())
     }
     
-    pub fn populate_bboxes(source_id: &str, frame: &RawFrame, bboxes: &[ResultBBOX]) -> Result<()> {
+    pub async fn populate_bboxes(source_id: &str, frame: &RawFrame, bboxes: &[ResultBBOX]) -> Result<()> {
         // Format BBOXes output for sending it back to the client
         let bboxes_json: Vec<_> = bboxes
             .iter()
@@ -167,22 +185,28 @@ impl ClientVideo {
         let results_source_id = source_id.parse::<c_int>()
             .expect("Failed to convert source id to integer");
 
-        unsafe {
-            let lib_post_results: Symbol<PostResultsFn> = client_video.library()
-                .get(b"PostResults")
-                .context("Cannot get 'PostResults' function")?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            unsafe {
+                let lib_post_results: Symbol<PostResultsFn> = client_video.library()
+                    .get(b"PostResults")
+                    .context("Cannot get 'PostResults' function")?;
 
 
-            let result = lib_post_results(
-                results_source_id,
-                results_bboxes.into_raw()
-            );
+                let result = lib_post_results(
+                    results_source_id,
+                    results_bboxes.into_raw()
+                );
 
-            // Check whether posting failed
-            if result != 0 {
-                anyhow::bail!("Failed to post bboxes")
+                // Check whether posting failed
+                if result != 0 {
+                    anyhow::bail!("Failed to post bboxes")
+                }
             }
-        }
+
+            Ok(())
+        }).await
+            .context("Error trying to post bboxes")?
+            .context("Error posting bboxes")?;
 
         Ok(())
     }
@@ -317,13 +341,12 @@ impl ClientVideo {
             slice::from_raw_parts(ptr, len)
         };
         
-        // Clone into a Vec (copies the data)
         Ok(slice.to_vec())
     }
 }
 
 impl ClientVideo {
     fn library(&self) -> &Library {
-        return &self.library
+        &self.library
     }
 }

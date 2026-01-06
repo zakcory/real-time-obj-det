@@ -1,25 +1,31 @@
 //! Responsible for handling video stream frames, sending them to inference
 //! and populating results to third party systems
 
-use std::sync::Arc;
-use std::sync::atomic::{Ordering, AtomicU64};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
-use anyhow::{Result, Context};
-use tokio::time::{Duration, interval, Instant};
-use tokio::sync::{RwLock, Semaphore, OnceCell};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio::sync::{OnceCell, RwLock, Semaphore};
 
 // Custom modules
-use crate::inference;
-use crate::utils::queue::FixedSizeQueue;
-use crate::processing::{self, RawFrame, ResultBBOX, ResultEmbedding};
-use crate::utils::config::{AppConfig, SourceConfig, InferenceModelType, InferenceTask};
-use crate::utils::kafka::Kafka;
 use crate::client_video::ClientVideo;
+use crate::inference;
+use crate::processing::{self, RawFrame, ResultBBOX, ResultEmbedding};
+use crate::statistics::{FrameProcessStats, SourceStats};
+use crate::utils::config::{AppConfig, InferenceModelType, InferenceTask, SourceConfig};
+use crate::utils::queue::FixedSizeQueue;
+use crate::utils::elastic::Elastic;
 
 // Variables
-pub static PROCESSORS: OnceCell<RwLock<HashMap<String, Arc<SourceProcessor>>>> = OnceCell::const_new();
+pub static PROCESSORS: OnceCell<Arc<RwLock<HashMap<String, Arc<SourceProcessor>>>>> = OnceCell::const_new();
 pub static MAX_QUEUE_FRAMES: usize = 15;
-pub static SOURCE_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+pub fn get_source_processors() -> Result<Arc<RwLock<HashMap<String, Arc<SourceProcessor>>>>> {
+    PROCESSORS
+        .get()
+        .cloned()
+        .context("Source processors not initiated")
+}
 
 /// Returns a source processor instance by given stream ID
 pub async fn get_source_processor(stream_id: &str) -> Result<Arc<SourceProcessor>> {
@@ -35,125 +41,36 @@ pub async fn get_source_processor(stream_id: &str) -> Result<Arc<SourceProcessor
 
 /// Initiates source processors for given list of sources
 pub async fn init_source_processors(app_config: &AppConfig) -> Result<()> {
-    let mut processors: HashMap<String, Arc<SourceProcessor>> = HashMap::new();
-    
+    let processors = PROCESSORS
+        .get_or_init(|| async { Arc::new(RwLock::new(HashMap::new())) })
+        .await;
+    let mut processors = processors.write().await;
+
+    // Clean processors
+    processors.clear();
+
+    // Insert new processors
     for (source_id, source_config) in app_config.sources_config().sources.iter() {
         // Start processor
-        let processor = Arc::new(
-            SourceProcessor::new(
-                source_id.to_string(),
-                source_config.clone(),
-                app_config.inference_config().task
-            )
-        );
-        
-        processors.insert(
+        let processor = Arc::new(SourceProcessor::new(
             source_id.to_string(),
-            processor
-        );
+            source_config.clone(),
+            app_config.inference_config().task,
+        ));
+
+        processors.insert(source_id.to_string(), processor);
     }
-    
-    // Initialize OnceCell if not already set, then write
-    let rwlock = PROCESSORS.get_or_init(|| async { RwLock::new(HashMap::new()) }).await;
-    let mut guard = rwlock.write().await;
-    *guard = processors;
-    
+
     Ok(())
 }
 
-/// Responsible for giving information about times at specific parts of inference
-pub struct FrameProcessStats {
-    pub queue: u64,
-    pub pre_processing: u64,
-    pub inference: u64,
-    pub post_processing: u64,
-    pub results: u64,
-    pub processing: u64
-}
-
-impl Default for FrameProcessStats {
-    fn default() -> Self {
-        Self {
-            queue: 0,
-            pre_processing: 0,
-            inference: 0,
-            post_processing: 0,
-            results: 0,
-            processing: 0
-        }
-    }
-}
-
-impl FrameProcessStats {
-    pub fn accumulate(&mut self, other: &Self) {
-        self.queue += other.queue;
-        self.pre_processing += other.pre_processing;
-        self.inference += other.inference;
-        self.post_processing += other.post_processing;
-        self.results += other.results;
-        self.processing += other.processing;
-    }
-}
-
-pub struct SourceStats {
-    pub frames_total: AtomicU64,
-    pub frames_expected: AtomicU64,
-    pub frames_success: AtomicU64,
-    pub frames_failed: AtomicU64,
-    pub total_queue_time: AtomicU64,
-    pub total_pre_proc_time: AtomicU64,
-    pub total_inference_time: AtomicU64,
-    pub total_post_proc_time: AtomicU64,
-    pub total_results_time: AtomicU64,
-    pub total_processing_time: AtomicU64
-}
-
-impl SourceStats {
-    pub fn new() -> Self {
-        Self {
-            frames_total: AtomicU64::new(0),
-            frames_expected: AtomicU64::new(0),
-            frames_success: AtomicU64::new(0),
-            frames_failed: AtomicU64::new(0),
-            total_queue_time: AtomicU64::new(0),
-            total_pre_proc_time: AtomicU64::new(0),
-            total_inference_time: AtomicU64::new(0),
-            total_post_proc_time: AtomicU64::new(0),
-            total_results_time: AtomicU64::new(0),
-            total_processing_time: AtomicU64::new(0)
-        }
-    }
-
-    pub fn reset(&self) {
-        self.frames_total.store(0, Ordering::Relaxed);
-        self.frames_expected.store(0, Ordering::Relaxed);
-        self.frames_success.store(0, Ordering::Relaxed);
-        self.frames_failed.store(0, Ordering::Relaxed);
-        self.total_queue_time.store(0, Ordering::Relaxed);
-        self.total_pre_proc_time.store(0, Ordering::Relaxed);
-        self.total_inference_time.store(0, Ordering::Relaxed);
-        self.total_post_proc_time.store(0, Ordering::Relaxed);
-        self.total_results_time.store(0, Ordering::Relaxed);
-        self.total_processing_time.store(0, Ordering::Relaxed);
-    }
-
-    pub fn accumulate(&self, stats: &FrameProcessStats) {
-        self.total_queue_time.fetch_add(stats.queue, Ordering::Relaxed);
-        self.total_pre_proc_time.fetch_add(stats.pre_processing, Ordering::Relaxed);
-        self.total_inference_time.fetch_add(stats.inference, Ordering::Relaxed);
-        self.total_post_proc_time.fetch_add(stats.post_processing, Ordering::Relaxed);
-        self.total_results_time.fetch_add(stats.results, Ordering::Relaxed);
-        self.total_processing_time.fetch_add(stats.processing, Ordering::Relaxed);
-    }
-}
-
 /// Responsible for managing inference/processing for each source
-/// 
-/// Performs inference for each source seperately. Allows us to control 
+///
+/// Performs inference for each source seperately. Allows us to control
 /// each source seperately, with various settings, such as:
 /// 1. confidence_threshold: What confidence threshold we apply to results for this specific source.
 /// Especially relevant in case this source is known as more problematic and requires higher confidence
-/// 2. inference_frame: How many frames we want to skip before performing inference. In other words, 
+/// 2. inference_frame: How many frames we want to skip before performing inference. In other words,
 /// "Inference on every N frame". This allows us to skip inference on frames when source has higher frame
 /// rate, having minimal effect on the end user's experience.
 #[allow(dead_code)]
@@ -162,33 +79,32 @@ pub struct SourceProcessor {
     queue: Arc<FixedSizeQueue<Arc<RawFrame>>>,
     queue_semaphore: Arc<Semaphore>,
     process_handle: tokio::task::JoinHandle<()>,
-    stats_handle: tokio::task::JoinHandle<()>,
 
     // Source specific settings
     source_id: Arc<String>,
     source_config: Arc<SourceConfig>,
     source_stats: Arc<SourceStats>,
-    inference_task: InferenceTask
+    inference_task: InferenceTask,
 }
 
 impl SourceProcessor {
     /// Creates a new instance of source processor
-    /// 
+    ///
     /// 1. Creates a seperate channel of communication between the main thread and a seperate
     /// thread pool, so we can send frames for inference and not block the execution of other parts
     /// of our code.
-    /// 2. Reports statistics about the given source processor in terms performance, including times of 
-    /// processing, how many successful/failed frames we have and what is our general success rate 
+    /// 2. Reports statistics about the given source processor in terms performance, including times of
+    /// processing, how many successful/failed frames we have and what is our general success rate
     pub fn new(
         source_id: String,
         source_config: SourceConfig,
-        inference_task: InferenceTask
+        inference_task: InferenceTask,
     ) -> Self {
         // Create global counters
         let source_id = Arc::new(source_id);
         let source_stats = Arc::new(SourceStats::new());
         let source_config = Arc::new(source_config);
-        
+
         // Create a queue for frames. We set a maximum number of frames possible to be in queue at a given time
         // When the limit reaches, it drops the oldest frame in the queue, making it possible for new frames
         // to be added to the queue and be processed.
@@ -196,9 +112,12 @@ impl SourceProcessor {
         let queue_drop_callback = move |_: Arc<RawFrame>| {
             queue_stats.frames_failed.fetch_add(1, Ordering::Relaxed);
         };
-        let source_queue = Arc::new(FixedSizeQueue::<Arc<RawFrame>>::new(MAX_QUEUE_FRAMES, Some(queue_drop_callback)));
+        let source_queue = Arc::new(FixedSizeQueue::<Arc<RawFrame>>::new(
+            MAX_QUEUE_FRAMES,
+            Some(queue_drop_callback),
+        ));
         let queue_semaphore = Arc::new(Semaphore::new(MAX_QUEUE_FRAMES));
-        
+
         // Create a seperate task for handling frames - performing inference
         let process_queue_semaphore = Arc::clone(&queue_semaphore);
         let process_source_queue = Arc::clone(&source_queue);
@@ -230,93 +149,75 @@ impl SourceProcessor {
                                         process_source_id_int,
                                         &process_source_config,
                                         process_frame,
-                                        inference_task
-                                    ).await;
+                                        inference_task,
+                                    )
+                                    .await;
 
                                     // Count processing statistics
-                                    process_source_stats.frames_total.fetch_add(1, Ordering::Relaxed);
-                                    process_source_stats.frames_expected.fetch_add(1, Ordering::Relaxed);
+                                    process_source_stats
+                                        .frames_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    process_source_stats
+                                        .frames_expected
+                                        .fetch_add(1, Ordering::Relaxed);
                                     match &process_result {
                                         Ok(stats) => {
-                                            process_source_stats.frames_success.fetch_add(1, Ordering::Relaxed);
+                                            process_source_stats
+                                                .frames_success
+                                                .fetch_add(1, Ordering::Relaxed);
 
                                             // Add inference statistics to counters
                                             process_source_stats.accumulate(&stats);
-                                        },
+                                        }
                                         Err(_) => {
-                                            process_source_stats.frames_failed.fetch_add(1, Ordering::Relaxed);
+                                            process_source_stats
+                                                .frames_failed
+                                                .fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
-                                    
+
                                     // Handle processing error
                                     if let Err(e) = process_result {
                                         tracing::error!(
-                                            source_id=&*process_source_id_ext,
-                                            error=e.to_string(),
+                                            source_id = &*process_source_id_ext,
+                                            error = ?e,
                                             "error processing source frame"
                                         )
                                     };
                                 });
                             }
-                        },
+                        }
                         Err(e) => {
                             tracing::info!(
-                                source_id=&*process_source_id,
-                                error=e.to_string(),
+                                source_id = &*process_source_id,
+                                error = e.to_string(),
                                 "Error acquiring permit for parallelism. Should not happen"
                             )
                         }
                     }
                 }
-            }.await;
+            }
+            .await;
 
             if let Err(e) = frame_process {
                 tracing::error!(
-                    source_id=&*process_source_id,
-                    error=e.to_string(),
+                    source_id = &*process_source_id,
+                    error = e.to_string(),
                     "Stopped processing frames - due to fatal error"
                 )
             }
         });
 
-        // Create a seperate task for printing source statistics
-        let stats_source_id = source_id.clone();
-        let stats_source_config = source_config.clone();
-        let stats_source_stats = Arc::clone(&source_stats);
-        let stats_interval = SOURCE_STATS_INTERVAL.clone();
+        tracing::info!(source_id = &*source_id, "initiated client processing");
 
-        let stats_handle = tokio::spawn(async move {
-            let mut interval = interval(stats_interval);
-            
-            loop {
-                interval.tick().await;
-
-                Self::process_stats_internal(
-                    &stats_source_id, 
-                    &stats_source_config,
-                    &stats_source_stats
-                );
-
-                // Reset statistics
-                stats_source_stats.reset();
-
-            }
-        });
-
-        tracing::info!(
-            source_id=&*source_id,
-            "initiated client processing"
-        );
-        
         Self {
             queue: source_queue,
             queue_semaphore,
             process_handle,
-            stats_handle,
             source_id,
             source_config,
             source_stats,
-            inference_task
+            inference_task,
         }
     }
 
@@ -327,21 +228,21 @@ impl SourceProcessor {
         // Send inference results on every N frame
         if (frames_total + 1) % (self.source_config.inf_frame as u64) == 0 {
             // Create new frame object
-            let frame = Arc::new(
-                RawFrame {
-                    data: raw_frame,
-                    height,
-                    width,
-                    pts,
-                    added: Instant::now()
-                }
-            );
+            let frame = Arc::new(RawFrame {
+                data: raw_frame,
+                height,
+                width,
+                pts,
+                added: tokio::time::Instant::now(),
+            });
 
             // Send new frame to queue
             self.queue.sender.send_async(frame).await;
         } else {
             // Add to statistics
-            self.source_stats.frames_total.fetch_add(1, Ordering::Relaxed);
+            self.source_stats
+                .frames_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -350,93 +251,108 @@ impl SourceProcessor {
     async fn process_frame_internal(
         source_id: Arc<String>,
         source_config: &SourceConfig,
-        frame: Arc<RawFrame>, 
-        inference_task: InferenceTask
+        frame: Arc<RawFrame>,
+        inference_task: InferenceTask,
     ) -> Result<FrameProcessStats> {
         let frame_queue_time = frame.added.elapsed();
-        
+
         // Perform inference on raw frame and populate results
         let mut stats = match inference_task {
             InferenceTask::ObjectDetection => {
                 // Get BBOXes for frame
-                let bboxes_model = inference::get_inference_model(InferenceModelType::YOLO)?;
-                let bboxes_frame = Arc::clone(&frame);
-                let (mut bboxes_stats, bboxes) = processing::yolo::process_frame(
-                    &bboxes_model,
-                    &source_config,
-                    bboxes_frame
-                ).await?;
+                let yolo_model = inference::get_inference_model(InferenceModelType::YOLO)?;
+                let yolo_frame = Arc::clone(&frame);
+                let (mut yolo_stats, bboxes) =
+                    processing::yolo::process_frame(&yolo_model, &source_config, yolo_frame)
+                        .await?;
 
                 // Populate BBOXes if we have any
                 if bboxes.len() > 0 {
-                    let measure_start = Instant::now();
+                    let measure_start = tokio::time::Instant::now();
 
                     // Populate BBOXes to third party services
                     let results_source_id = Arc::clone(&source_id);
                     let results_frame = Arc::clone(&frame);
                     let results_arc = Arc::new(bboxes);
-                    SourceProcessor::populate_bboxes(
-                        results_source_id, 
-                        results_frame, 
-                        results_arc
-                    ).await;
+                    SourceProcessor::populate_bboxes(results_source_id, results_frame, results_arc)
+                        .await;
 
                     // Update results time
                     let results_time = measure_start.elapsed();
-                    bboxes_stats.results += results_time.as_micros() as u64;
+                    yolo_stats.results += results_time.as_micros() as u64;
                 }
 
-                bboxes_stats
-            },
+                yolo_stats
+            }
             InferenceTask::Embedding => {
-                // Get BBOXes for frame
-                let bboxes_model = inference::get_inference_model(InferenceModelType::YOLO)?;
-                let bboxes_frame = Arc::clone(&frame);
-                let (bboxes_stats, bboxes) = processing::yolo::process_frame(
-                    &bboxes_model,
-                    &source_config,
-                    bboxes_frame
-                ).await?;
-                let bboxes = Arc::new(bboxes);
+                let mut final_stats = FrameProcessStats::default();
 
-                // Get embeddings for frame and bboxes
-                let embedding_model = inference::get_inference_model(InferenceModelType::DINO)?;
-                let embedding_bboxes = Arc::clone(&bboxes);
-                let embedding_frame = Arc::clone(&frame);
-                let (mut embedding_stats, embeddings): (FrameProcessStats, Vec<ResultEmbedding>) = processing::dino::process_frame(
-                    &embedding_model,
-                    embedding_frame,
-                    embedding_bboxes
-                ).await?;
-                let embeddings = Arc::new(embeddings);
+                // Prepare models
+                let yolo_model = inference::get_inference_model(InferenceModelType::YOLO)?;
+                let dino_model = inference::get_inference_model(InferenceModelType::DINO)?;
+                
+                // Prepare inputs for parallel execution
+                let yolo_frame = Arc::clone(&frame);
+                let dino_frame = Arc::clone(&frame);
+                
+                // Execute YOLO and DINO frame inference in parallel
+                let (
+                    (yolo_stats, bboxes),
+                    (dino_frame_stats, dino_frame_embedding)
+                ) = tokio::try_join!(
+                    processing::yolo::process_frame(yolo_model, &source_config, yolo_frame),
+                    processing::dino::process_frame(dino_model, dino_frame)
+                )?;
+
+                // Accumulate statistics
+                final_stats.accumulate(&yolo_stats);
+                final_stats.accumulate(&dino_frame_stats);
+                
+                // Process BBOXes with DINO
+                let mut all_embeddings = Vec::with_capacity(1 + bboxes.len());
+                all_embeddings.push(dino_frame_embedding);
+
+                if bboxes.len() > 0 {
+                    let bboxes = Arc::new(bboxes);
+
+                    let dino_bbox_model = inference::get_inference_model(InferenceModelType::DINO_BBOXES)?;
+                    let dino_bbox_frame = Arc::clone(&frame);
+                    let dino_bbox_bboxes = Arc::clone(&bboxes);
+                
+                    let (dino_bbox_stats, mut dino_bbox_embeddings) = processing::dino::process_bboxes(
+                        dino_bbox_model,
+                        dino_bbox_frame,
+                        dino_bbox_bboxes
+                    ).await?;
+
+                    all_embeddings.append(&mut dino_bbox_embeddings);
+                    final_stats.accumulate(&dino_bbox_stats);
+                }
 
                 // Populate embeddings if we have any
-                if embeddings.len() > 0 {
-                    let measure_start = Instant::now();
+                if all_embeddings.len() > 0 {
+                    let all_embeddings = Arc::new(all_embeddings);
+                    let measure_start = tokio::time::Instant::now();
 
                     // Populate embeddings to third party services
                     let results_source_id = Arc::clone(&source_id);
                     let results_frame = Arc::clone(&frame);
-                    let results_embeddings = Arc::clone(&embeddings);
+                    let results_embeddings = Arc::clone(&all_embeddings);
                     SourceProcessor::populate_embeddings(
-                        results_source_id, 
-                        results_frame, 
-                        results_embeddings
-                    ).await;
+                        results_source_id,
+                        results_frame,
+                        results_embeddings,
+                    )
+                    .await;
 
                     // Update results time
                     let results_time = measure_start.elapsed();
-                    embedding_stats.results += results_time.as_micros() as u64;
+                    final_stats.results += results_time.as_micros() as u64;
                 }
-
-                // Combine statistics
-                let mut final_stats = FrameProcessStats::default();
-                final_stats.accumulate(&bboxes_stats);
-                final_stats.accumulate(&embedding_stats);
 
                 final_stats
             }
-            _ => anyhow::bail!("Model task is not supported for processing!")
+            _ => anyhow::bail!("Model task is not supported for processing!"),
         };
 
         // Return statistics
@@ -445,62 +361,11 @@ impl SourceProcessor {
         Ok(stats)
     }
 
-    /// Reports inference statistics for the given source processor
-    fn process_stats_internal(
-        source_id: &str,
-        source_config: &SourceConfig,
-        source_stats: &SourceStats
-    ) {
-        let mut avg_queue: f64 = 0.00;
-        let mut avg_pre_proc: f64 = 0.00;
-        let mut avg_inference: f64 = 0.00;
-        let mut avg_post_proc: f64 = 0.00;
-        let mut avg_results: f64 = 0.00;
-        let mut avg_processing: f64 = 0.00;
-
-        // Extract values of statistics
-        let frames_total = source_stats.frames_total.load(Ordering::Relaxed) as u64;
-        let frames_expected = source_stats.frames_expected.load(Ordering::Relaxed) as u64;
-        let frames_success = source_stats.frames_success.load(Ordering::Relaxed) as u64;
-        let frames_failed = source_stats.frames_failed.load(Ordering::Relaxed) as u64;
-        let total_queue_time = source_stats.total_queue_time.load(Ordering::Relaxed) as u64;
-        let total_pre_proc_time = source_stats.total_pre_proc_time.load(Ordering::Relaxed) as u64;
-        let total_inference_time = source_stats.total_inference_time.load(Ordering::Relaxed) as u64;
-        let total_post_proc_time = source_stats.total_post_proc_time.load(Ordering::Relaxed) as u64;
-        let total_results_time = source_stats.total_results_time.load(Ordering::Relaxed) as u64;
-        let total_processing_time = source_stats.total_processing_time.load(Ordering::Relaxed) as u64;
-        
-        if frames_success > 0 {
-            avg_queue = (total_queue_time as f64) / (frames_success as f64);
-            avg_pre_proc = (total_pre_proc_time as f64) / (frames_success as f64);
-            avg_inference = (total_inference_time as f64) / (frames_success as f64);
-            avg_post_proc = (total_post_proc_time as f64) / (frames_success as f64);
-            avg_results = (total_results_time as f64) / (frames_success as f64);
-            avg_processing = (total_processing_time as f64) / (frames_success as f64);
-        }
-
-        tracing::info!(
-            source_id=source_id,
-            inference_every_n=source_config.inf_frame,
-            frames_total=frames_total,
-            frames_expected=frames_expected,
-            frames_success=frames_success,
-            frames_failed=frames_failed,
-            avg_queue=avg_queue,
-            avg_pre_proc=avg_pre_proc,
-            avg_inference=avg_inference,
-            avg_post_proc=avg_post_proc,
-            avg_results=avg_results,
-            avg_processing=avg_processing,
-            "inference statistics"
-        );
-    }
-
     /// Populates BBOXes to third party services
     pub async fn populate_bboxes(
-        source_id: Arc<String>, 
-        frame: Arc<RawFrame>, 
-        bboxes: Arc<Vec<ResultBBOX>>
+        source_id: Arc<String>,
+        frame: Arc<RawFrame>,
+        bboxes: Arc<Vec<ResultBBOX>>,
     ) {
         let bboxes = Arc::new(bboxes);
 
@@ -509,67 +374,43 @@ impl SourceProcessor {
         let client_frame = Arc::clone(&frame);
         let client_bboxes = Arc::clone(&bboxes);
 
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            ClientVideo::populate_bboxes(
-                &client_source_id,
-                &client_frame,
-                &client_bboxes
-            )
-        }).await {
+        if let Err(e) = ClientVideo::populate_bboxes(
+            &client_source_id, 
+            &client_frame, 
+            &client_bboxes
+        ).await {
             tracing::warn!(
-                source_id=&*source_id,
-                error=e.to_string(),
+                source_id = &*source_id,
+                error = ?e,
                 "Failed to populate bboxes to client video"
             );
         };
-
-
-        // Send to Kafka - don't wait for results
-        // Will run in a seperate task
-        let kafka_source_id = Arc::clone(&source_id);
-        let kafka_frame = Arc::clone(&frame);
-        let kafka_bboxes = Arc::clone(&bboxes);
-
-        tokio::task::spawn(async move {
-            if let Err(e) = Kafka::populate_bboxes(
-                &kafka_source_id,
-                &kafka_frame,
-                &kafka_bboxes
-            ).await {
-                // tracing::warn!(
-                //     source_id=&*kafka_source_id,
-                //     error=e.to_string(),
-                //     "Failed to populate bboxes to Kafka"
-                // );
-            };
-        });
     }
 
     /// Populates embedding to third party services
+    #[allow(unused_variables)]
     pub async fn populate_embeddings(
-        source_id: Arc<String>, 
-        frame: Arc<RawFrame>, 
-        embeddings: Arc<Vec<ResultEmbedding>>
+        source_id: Arc<String>,
+        frame: Arc<RawFrame>,
+        embeddings: Arc<Vec<ResultEmbedding>>,
     ) {
-        // Send to Kafka - don't wait for results
-        // Will run in a seperate task
-        let kafka_source_id = Arc::clone(&source_id);
-        let kafka_frame = Arc::clone(&frame);
-        let kafka_embeddings = Arc::clone(&embeddings);
+        if let Err(e) = Elastic::populate_embeddings(
+            &source_id, 
+            frame.pts, 
+            &embeddings
+        ).await {
+            tracing::warn!(
+                source_id = &*source_id,
+                error = ?e,
+                "Failed to populate embeddings to elastic"
+            );
+        }
+    }
+}
 
-        tokio::task::spawn(async move {
-            if let Err(e) = Kafka::populate_embeddings(
-                &kafka_source_id,
-                &kafka_frame,
-                &kafka_embeddings
-            ).await {
-                // tracing::warn!(
-                //     source_id=&*kafka_source_id,
-                //     error=e.to_string(),
-                //     "Failed to populate embeddings to Kafka"
-                // );
-            };
-        });
+impl SourceProcessor {
+    pub fn source_stats(&self) -> &SourceStats {
+        &self.source_stats
     }
 }
 
@@ -577,6 +418,5 @@ impl Drop for SourceProcessor {
     fn drop(&mut self) {
         // Abort tokio tasks
         self.process_handle.abort();
-        self.stats_handle.abort();
     }
 }

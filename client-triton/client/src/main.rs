@@ -1,13 +1,12 @@
 use anyhow::{Result, Context};
 
 // Custom modules
-use client::inference;
-use client::source;
+use client::{source, inference, statistics};
 use client::utils::{
-    kafka,
-    config::AppConfig
+    config::AppConfig,
+    elastic
 };
-use client::client_video::ClientVideo;
+use client::client_video::{self, ClientVideo};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -19,10 +18,9 @@ async fn main() -> Result<()> {
         .await
         .context("Error initializing tokio runtime")?;
 
-    // Initiate Kafka producer
-    kafka::init_kafka_producer(&app_config)
+    elastic::init_elastic(&app_config)
         .await
-        .context("Error initiating Kafka producer")?;
+        .context("Error initiating elastic")?;
 
     // Initiate inference client
     inference::init_inference_models(&app_config)
@@ -38,10 +36,13 @@ async fn main() -> Result<()> {
         .await
         .context("Error initiating source processors")?;
 
+    // Initiate statistics
+    statistics::init_statistics()
+        .context("Error initiating statistics")?;
+
     // Start receiving frames from sources
-    ClientVideo::set_callbacks()
-        .await
-        .context("Error setting Client Video callbacks")?;
+    client_video::init_client_video()
+        .context("Error initiating client video")?;
 
     ClientVideo::init_sources(&app_config)
         .await

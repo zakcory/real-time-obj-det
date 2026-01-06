@@ -1,5 +1,4 @@
 services:
-  # ==================== KAFKA SERVICES ====================
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     hostname: zookeeper

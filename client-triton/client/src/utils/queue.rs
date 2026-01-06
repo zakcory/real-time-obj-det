@@ -112,4 +112,9 @@ impl<T> FixedSizeQueueReceiver<T> {
             notified.await;
         }
     }
+
+    pub async fn drain(&self) -> Vec<T> {
+        let mut queue = self.queue.lock().await;
+        queue.drain(..).collect()
+    }
 }

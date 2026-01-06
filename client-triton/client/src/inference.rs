@@ -13,19 +13,12 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use anyhow::{self, Result, Context};
-use std::time::{Duration, Instant};
 
 // Custom modules
-use crate::utils::{
-    self,
-    GPUStats,
-    config::{AppConfig, ModelConfig, TritonConfig}
-};
-use crate::utils::config::{InferenceModelType, InferencePrecision};
+use crate::utils::config::{AppConfig, ModelConfig, TritonConfig, InferenceModelType, InferencePrecision};
 
 // Variables
 pub static INFERENCE_MODELS: OnceCell<HashMap<InferenceModelType, Arc<InferenceModel>>> = OnceCell::const_new();
-pub static GPU_STATS_INTERVAL: Duration = Duration::from_secs(200);
 
 /// Returns the inference model instance, if initiated
 pub fn get_inference_model(model_type: InferenceModelType) -> Result<&'static Arc<InferenceModel>> {
@@ -100,8 +93,7 @@ pub struct InferenceModel {
     client: Arc<Client>,
     triton_config: TritonConfig,
     model_config: ModelConfig,
-    base_request: ModelInferRequest,
-    stats_handle: std::thread::JoinHandle<()>
+    base_request: ModelInferRequest
 }
 
 impl InferenceModel {
@@ -155,44 +147,11 @@ impl InferenceModel {
             raw_input_contents: Vec::new()
         };
 
-
-        // Spawn seperate task to monitor GPU stats
-        let stats_interval = GPU_STATS_INTERVAL.clone();
-
-        let stats_handle = std::thread::spawn(move || {
-            loop {
-                let measure_time = Instant::now();
-
-                // Get GPU statistics
-                let stats_result = utils::get_gpu_statistics();
-
-                match stats_result {
-                    Ok(stats) => {
-                        InferenceModel::process_gpu_stats(stats);
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error=e.to_string(),
-                            "Error getting GPU utilization information"
-                        )
-                    }
-                };
-
-                // Sleep if time remains
-                let remainder = measure_time.elapsed();
-                if remainder < stats_interval {
-                    let duration = stats_interval - remainder;
-                    std::thread::sleep(duration);
-                }
-            }
-        });
-
         Ok(Self { 
             client: Arc::new(client),
             triton_config,
             model_config,
-            base_request,
-            stats_handle
+            base_request
         })
     }
 
@@ -290,7 +249,7 @@ impl InferenceModel {
         self.client.repository_model_load(RepositoryModelLoadRequest { 
             repository_name: "".to_string(), 
             model_name: self.model_config().name.to_string(), 
-            parameters: parameters
+            parameters
         })
             .await
             .context("Error loading triton model instances")?;
@@ -302,8 +261,7 @@ impl InferenceModel {
     /// Automatically batches requests up to max_batch_size and processes batches concurrently
     pub async fn infer(&self, raw_inputs: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
         let max_batch_size = self.model_config.batch_max_size as usize;
-        let num_inputs = raw_inputs.len();
-        
+        let num_inputs = raw_inputs.len();        
         // Calculate output size per sample once
         let output_size_per_sample: usize = self.model_config.output_shape
             .iter()
@@ -317,88 +275,107 @@ impl InferenceModel {
         let mut all_results: Vec<Vec<u8>> = Vec::with_capacity(num_inputs);
         all_results.resize_with(num_inputs, Vec::new);
         
-        // Process all batches concurrently (1 batch if num_inputs <= max_batch_size)
-        let tasks: Vec<_> = raw_inputs
-            .chunks(max_batch_size)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let batch_size = chunk.len();
-                let start_idx = chunk_idx * max_batch_size;
-                
-                // Concatenate batch for Triton
-                let total_bytes: usize = chunk.iter().map(|v| v.len()).sum();
-                let mut concatenated = Vec::with_capacity(total_bytes);
-                for input in chunk {
-                    concatenated.extend_from_slice(input);
+        // Fast path: if inputs fit in one batch, execute directly without spawning tasks
+        if num_inputs <= max_batch_size {
+            let total_bytes: usize = raw_inputs.iter().map(|v| v.len()).sum();
+            let mut concatenated = Vec::with_capacity(total_bytes);
+            for input in &raw_inputs {
+                concatenated.extend_from_slice(input);
+            }
+            
+            let mut inference_request = self.base_request.clone();
+            inference_request.inputs[0].shape.insert(0, num_inputs as i64);
+            inference_request.raw_input_contents = vec![concatenated];
+            
+            // Network I/O - direct await
+            let inference_result = self.client.model_infer(inference_request)
+                .await
+                .context("Error sending triton inference request")?;
+            
+            let output_blob = inference_result.raw_output_contents.into_iter().next()
+                .context("No output from inference")?;
+            
+            // Process results directly
+            // We do this inline because for a single batch the overhead of spawning a blocking task
+            // might outweigh the benefit, and we want to minimize latency.
+            let ptr = output_blob.as_ptr();
+            unsafe {
+                for i in 0..num_inputs {
+                    let offset = i * output_size_per_sample;
+                    let slice = std::slice::from_raw_parts(ptr.add(offset), output_size_per_sample);
+                    all_results[i] = slice.to_vec();
                 }
-                
-                let mut inference_request = self.base_request.clone();
-                inference_request.inputs[0].shape.insert(0, batch_size as i64);
-                inference_request.raw_input_contents = vec![concatenated];
-                
-                let client = Arc::clone(&self.client);
-                let output_size = output_size_per_sample;
-                
-                tokio::spawn(async move {
-                    // Network I/O - async
-                    let inference_result = client.model_infer(inference_request)
-                        .await
-                        .context("Error sending triton inference request")?;
+            }
+        } else {     
+            // Process all batches concurrently (1 batch if num_inputs <= max_batch_size)
+            let tasks: Vec<_> = raw_inputs
+                .chunks(max_batch_size)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let batch_size = chunk.len();
+                    let start_idx = chunk_idx * max_batch_size;
                     
-                    // CPU work - blocking thread pool
-                    let output_blob = inference_result.raw_output_contents.into_iter().next()
-                        .context("No output from inference")?;
+                    // Concatenate batch for Triton
+                    let total_bytes: usize = chunk.iter().map(|v| v.len()).sum();
+                    let mut concatenated = Vec::with_capacity(total_bytes);
+                    for input in chunk {
+                        concatenated.extend_from_slice(input);
+                    }
                     
-                    let batch_results = tokio::task::spawn_blocking(move || {
-                        // Unsafe pointer slicing for blazing speed
-                        let ptr = output_blob.as_ptr();
-                        let mut results = Vec::with_capacity(batch_size);
+                    let mut inference_request = self.base_request.clone();
+                    inference_request.inputs[0].shape.insert(0, batch_size as i64);
+                    inference_request.raw_input_contents = vec![concatenated];
+                    
+                    let client = Arc::clone(&self.client);
+                    let output_size = output_size_per_sample;
+                    
+                    tokio::spawn(async move {
+                        // Network I/O - async
+                        let inference_result = client.model_infer(inference_request)
+                            .await
+                            .context("Error sending triton inference request")?;
                         
-                        unsafe {
-                            for i in 0..batch_size {
-                                let offset = i * output_size;
-                                let slice = std::slice::from_raw_parts(ptr.add(offset), output_size);
-                                results.push(slice.to_vec());
+                        // CPU work - blocking thread pool
+                        let output_blob = inference_result.raw_output_contents.into_iter().next()
+                            .context("No output from inference")?;
+                        
+                        let batch_results = tokio::task::spawn_blocking(move || {
+                            // Unsafe pointer slicing for blazing speed
+                            let ptr = output_blob.as_ptr();
+                            let mut results = Vec::with_capacity(batch_size);
+                            
+                            unsafe {
+                                for i in 0..batch_size {
+                                    let offset = i * output_size;
+                                    let slice = std::slice::from_raw_parts(ptr.add(offset), output_size);
+                                    results.push(slice.to_vec());
+                                }
                             }
-                        }
+                            
+                            results
+                        })
+                        .await
+                        .context("Failed to split batch results")?;
                         
-                        results
+                        Ok::<(usize, Vec<Vec<u8>>), anyhow::Error>((start_idx, batch_results))
                     })
-                    .await
-                    .context("Failed to split batch results")?;
-                    
-                    Ok::<(usize, Vec<Vec<u8>>), anyhow::Error>((start_idx, batch_results))
                 })
-            })
-            .collect();
-        
-        // Await all batches and place directly
-        let results = futures::future::try_join_all(tasks)
-            .await
-            .context("Error performing inference on all inputs")?;
-        
-        for result in results {
-            let (start_idx, batch) = result?;
-            for (i, output) in batch.into_iter().enumerate() {
-                all_results[start_idx + i] = output;
+                .collect();
+            
+            // Await all batches and place directly
+            let results = futures::future::try_join_all(tasks)
+                .await
+                .context("Error performing inference on all inputs")?;
+            
+            for result in results {
+                let (start_idx, batch) = result?;
+                for (i, output) in batch.into_iter().enumerate() {
+                    all_results[start_idx + i] = output;
+                }
             }
         }
-        
-        Ok(all_results)
-    }
 
-    pub fn process_gpu_stats(stats: GPUStats) {
-        tracing::info!(
-            name=stats.name,
-            uuid=stats.uuid,
-            serial=stats.serial,
-            memory_total_mb=stats.memory_total,
-            memory_used_mb=stats.memory_used,
-            memory_free_mb=stats.memory_free,
-            util_perc=stats.util_perc,
-            memory_perc=stats.memory_perc,
-            "GPU utilization information"
-        );
+        Ok(all_results)
     }
 }
 
@@ -417,9 +394,5 @@ impl InferenceModel {
 
     pub fn base_request(&self) -> &ModelInferRequest {
         &self.base_request
-    }
-
-    pub fn stats_handle(&self) -> &std::thread::JoinHandle<()> {
-        &self.stats_handle
     }
 }

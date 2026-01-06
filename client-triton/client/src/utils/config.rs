@@ -9,9 +9,6 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use serde_yaml;
 use serde::Deserialize;
 
-// Custom modules
-use crate::utils;
-
 /// Represents the local environment the codebase is on
 /// 
 /// Used mostly to read an environment variables file and
@@ -39,9 +36,9 @@ pub struct ModelConfig {
 pub struct SourcesConfig {
     #[serde(default)]
     pub sources: HashMap<String, SourceConfig>,
-
     pub ids: Vec<String>,
     pub default: SourceConfig,
+    #[serde(default)]
     pub custom: HashMap<String, SourceConfigOptional>
 }
 
@@ -73,6 +70,12 @@ pub struct KafkaConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct ElasticConfig {
+    pub url: String,
+    pub index_name: String
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct InferenceConfig {
     pub models: HashMap<InferenceModelType, ModelConfig>,
     pub task: InferenceTask
@@ -96,9 +99,11 @@ impl InferencePrecision {
 
 /// Represents type of inference model
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Deserialize)]
+#[allow(non_camel_case_types)]
 pub enum InferenceModelType {
     YOLO,
     DINO,
+    DINO_BBOXES
 }
 
 impl InferenceModelType {
@@ -106,6 +111,7 @@ impl InferenceModelType {
         match self {
             InferenceModelType::YOLO => "YOLO",
             InferenceModelType::DINO => "DINO",
+            InferenceModelType::DINO_BBOXES => "DINO_BBOXES"
         }
     }
 }
@@ -122,12 +128,9 @@ pub enum InferenceTask {
 pub struct AppConfig {
     local: bool,
     environment: Environment,
-
-    #[serde(default)]
-    gpu_name: String,
-
     sources_config: SourcesConfig,
     kafka_config: KafkaConfig,
+    elastic_config: ElasticConfig,
     triton_config: TritonConfig,
     inference_config: InferenceConfig
 }
@@ -140,10 +143,6 @@ impl AppConfig {
 
         // Initiate app logging
         AppConfig::init_logging(config.local);
-
-        // GPU information
-        config.gpu_name = utils::get_gpu_name()
-            .context("Error getting GPU name")?;
 
         // Parse sources
         let mut sources: HashMap<String, SourceConfig> = HashMap::new();
@@ -236,16 +235,16 @@ impl AppConfig {
         self.environment
     }
 
-    pub fn gpu_name(&self) -> &str {
-        &self.gpu_name
-    }
-
     pub fn sources_config(&self) -> &SourcesConfig {
         &self.sources_config
     }
 
     pub fn kafka_config(&self) -> &KafkaConfig {
         &self.kafka_config
+    }
+
+    pub fn elastic_config(&self) -> &ElasticConfig {
+        &self.elastic_config
     }
 
     pub fn triton_config(&self) -> &TritonConfig {

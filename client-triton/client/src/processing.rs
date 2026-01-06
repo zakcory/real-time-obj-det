@@ -88,6 +88,16 @@ pub static F16_LUT: OnceLock<Box<[u16; 256]>> = OnceLock::new();
 /// Lookup table for converting pixel values to FP32
 pub static F32_LUT: OnceLock<Box<[f32; 256]>> = OnceLock::new();
 
+/// Lookup tables for ImageNet normalization (u8 -> normalized f32)
+pub static IMAGENET_R_F32_LUT: OnceLock<Box<[f32; 256]>> = OnceLock::new();
+pub static IMAGENET_G_F32_LUT: OnceLock<Box<[f32; 256]>> = OnceLock::new();
+pub static IMAGENET_B_F32_LUT: OnceLock<Box<[f32; 256]>> = OnceLock::new();
+
+/// Lookup tables for ImageNet normalization (u8 -> normalized f16)
+pub static IMAGENET_R_F16_LUT: OnceLock<Box<[u16; 256]>> = OnceLock::new();
+pub static IMAGENET_G_F16_LUT: OnceLock<Box<[u16; 256]>> = OnceLock::new();
+pub static IMAGENET_B_F16_LUT: OnceLock<Box<[u16; 256]>> = OnceLock::new();
+
 /// Create static lookup table for high speed conversion
 fn create_f16_to_f32_lut() -> Box<[f32; 65536]> {
     let mut lut = Box::new([0.0f32; 65536]);
@@ -222,38 +232,122 @@ pub fn get_f32_lut() -> &'static [f32; 256] {
         .get_or_init(create_f32_lut)
 }
 
+/// Create ImageNet normalization lookup tables for R channel (F32)
+fn create_imagenet_r_f32_lut() -> Box<[f32; 256]> {
+    let mut lut = Box::new([0.0f32; 256]);
+    let r_std_inv = 1.0 / IMAGENET_STD[0];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[0]) * r_std_inv;
+        lut[i] = normalized;
+    }
+    lut
+}
 
-#[derive(Copy, Clone, Debug)]
+/// Create ImageNet normalization lookup tables for G channel (F32)
+fn create_imagenet_g_f32_lut() -> Box<[f32; 256]> {
+    let mut lut = Box::new([0.0f32; 256]);
+    let g_std_inv = 1.0 / IMAGENET_STD[1];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[1]) * g_std_inv;
+        lut[i] = normalized;
+    }
+    lut
+}
+
+/// Create ImageNet normalization lookup tables for B channel (F32)
+fn create_imagenet_b_f32_lut() -> Box<[f32; 256]> {
+    let mut lut = Box::new([0.0f32; 256]);
+    let b_std_inv = 1.0 / IMAGENET_STD[2];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[2]) * b_std_inv;
+        lut[i] = normalized;
+    }
+    lut
+}
+
+/// Create ImageNet normalization lookup tables for R channel (F16)
+fn create_imagenet_r_f16_lut() -> Box<[u16; 256]> {
+    let mut lut = Box::new([0u16; 256]);
+    let r_std_inv = 1.0 / IMAGENET_STD[0];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[0]) * r_std_inv;
+        lut[i] = get_f32_to_f16_lut(normalized);
+    }
+    lut
+}
+
+/// Create ImageNet normalization lookup tables for G channel (F16)
+fn create_imagenet_g_f16_lut() -> Box<[u16; 256]> {
+    let mut lut = Box::new([0u16; 256]);
+    let g_std_inv = 1.0 / IMAGENET_STD[1];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[1]) * g_std_inv;
+        lut[i] = get_f32_to_f16_lut(normalized);
+    }
+    lut
+}
+
+/// Create ImageNet normalization lookup tables for B channel (F16)
+fn create_imagenet_b_f16_lut() -> Box<[u16; 256]> {
+    let mut lut = Box::new([0u16; 256]);
+    let b_std_inv = 1.0 / IMAGENET_STD[2];
+    for i in 0..256 {
+        let normalized = (i as f32 / 255.0 - IMAGENET_MEAN[2]) * b_std_inv;
+        lut[i] = get_f32_to_f16_lut(normalized);
+    }
+    lut
+}
+
+/// Get ImageNet-normalized lookup tables
+pub fn get_imagenet_r_f32_lut() -> &'static [f32; 256] {
+    IMAGENET_R_F32_LUT.get_or_init(create_imagenet_r_f32_lut)
+}
+
+pub fn get_imagenet_g_f32_lut() -> &'static [f32; 256] {
+    IMAGENET_G_F32_LUT.get_or_init(create_imagenet_g_f32_lut)
+}
+
+pub fn get_imagenet_b_f32_lut() -> &'static [f32; 256] {
+    IMAGENET_B_F32_LUT.get_or_init(create_imagenet_b_f32_lut)
+}
+
+pub fn get_imagenet_r_f16_lut() -> &'static [u16; 256] {
+    IMAGENET_R_F16_LUT.get_or_init(create_imagenet_r_f16_lut)
+}
+
+pub fn get_imagenet_g_f16_lut() -> &'static [u16; 256] {
+    IMAGENET_G_F16_LUT.get_or_init(create_imagenet_g_f16_lut)
+}
+
+pub fn get_imagenet_b_f16_lut() -> &'static [u16; 256] {
+    IMAGENET_B_F16_LUT.get_or_init(create_imagenet_b_f16_lut)
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct LetterboxParams {
-    pub pad_x: u32,
-    pub pad_y: u32,
     pub new_width: u32,
     pub new_height: u32,
+    pub pad_x: u32,
+    pub pad_y: u32,
+    pub scale: f32,
     pub inv_scale: f32,
 }
 
-/// Calculates values for letterbox padding
-pub fn calculate_letterbox(
-    height: u32,
-    width: u32,
-    target_size: u32,
-) -> LetterboxParams {
-    let max_dim = height.max(width) as f32;
-    let scale = (target_size as f32) / max_dim;
-    let inv_scale = max_dim / (target_size as f32);
-
-    let new_width = ((width as f32 * scale) as u32).min(target_size);
-    let new_height = ((height as f32 * scale) as u32).min(target_size);
-
-    let pad_x = (target_size - new_width) >> 1; // Bit shift for / 2
-    let pad_y = (target_size - new_height) >> 1;
+/// Calculate letterbox parameters for image resizing
+pub fn calculate_letterbox(in_h: u32, in_w: u32, target_size: u32) -> LetterboxParams {
+    let scale = (target_size as f32) / (in_h.max(in_w) as f32);
+    let new_width = (in_w as f32 * scale) as u32;
+    let new_height = (in_h as f32 * scale) as u32;
+    let pad_x = (target_size - new_width) / 2;
+    let pad_y = (target_size - new_height) / 2;
 
     LetterboxParams {
-        pad_x,
-        pad_y,
         new_width,
         new_height,
-        inv_scale,
+        pad_x,
+        pad_y,
+        scale,
+        inv_scale: 1.0 / scale,
     }
 }
 
@@ -294,7 +388,7 @@ pub fn resize_letterbox_and_normalize(
 
     let in_ptr = input.as_ptr();
 
-    // 4. Perform fused resize, normalization, and planar conversion
+    // 4. Process based on precision
     match precision {
         InferencePrecision::FP16 => {
             // Get the U8 -> F16 LUT (fast, L1-cache resident)
@@ -405,16 +499,7 @@ pub fn resize_letterbox_and_normalize_imagenet(
         InferencePrecision::FP32 => vec![0u8; num_pixels * 3 * 4],
     };
 
-    // 3. Get normalization constants
-    let r_mean = IMAGENET_MEAN[0];
-    let g_mean = IMAGENET_MEAN[1];
-    let b_mean = IMAGENET_MEAN[2];
-    let r_std_inv = 1.0 / IMAGENET_STD[0];
-    let g_std_inv = 1.0 / IMAGENET_STD[1];
-    let b_std_inv = 1.0 / IMAGENET_STD[2];
-    let norm_lut_f32 = get_f32_lut(); // u8 -> f32 (0-1)
-
-    // 4. Pre-calculate x-offsets for the source image
+    // 3. Pre-calculate x-offsets for the source image
     let mut x_offsets: Vec<u32> = Vec::with_capacity(letterbox.new_width as usize);
     for x in 0..letterbox.new_width {
         x_offsets.push(((x as f32 * letterbox.inv_scale) as u32).min(in_w - 1) * 3);
@@ -422,17 +507,17 @@ pub fn resize_letterbox_and_normalize_imagenet(
 
     let in_ptr = input.as_ptr();
 
-    // 5. Calculate padding values (normalized with ImageNet)
-    let pad_val_r = (norm_lut_f32[PAD_GRAY_COLOR] - r_mean) * r_std_inv;
-    let pad_val_g = (norm_lut_f32[PAD_GRAY_COLOR] - g_mean) * g_std_inv;
-    let pad_val_b = (norm_lut_f32[PAD_GRAY_COLOR] - b_mean) * b_std_inv;
-
-    // 6. Perform fused resize, normalization (pixel + ImageNet), and planar conversion
+    // 4. Perform fused resize, normalization (pixel + ImageNet), and planar conversion
     match precision {
         InferencePrecision::FP16 => {
-            let pad_val_r_f16 = get_f32_to_f16_lut(pad_val_r);
-            let pad_val_g_f16 = get_f32_to_f16_lut(pad_val_g);
-            let pad_val_b_f16 = get_f32_to_f16_lut(pad_val_b);
+            // Get pre-computed ImageNet normalization LUTs
+            let r_lut = get_imagenet_r_f16_lut();
+            let g_lut = get_imagenet_g_f16_lut();
+            let b_lut = get_imagenet_b_f16_lut();
+            
+            let pad_val_r_f16 = r_lut[PAD_GRAY_COLOR];
+            let pad_val_g_f16 = g_lut[PAD_GRAY_COLOR];
+            let pad_val_b_f16 = b_lut[PAD_GRAY_COLOR];
             
             let out_ptr = output.as_mut_ptr() as *mut u16;
             let (out_r, out_g, out_b) = unsafe {
@@ -448,29 +533,93 @@ pub fn resize_letterbox_and_normalize_imagenet(
             out_g.fill(pad_val_g_f16);
             out_b.fill(pad_val_b_f16);
 
-            // Write real pixels with ImageNet normalization
+            // Hoist constants
+            let pad_x = letterbox.pad_x;
+            let pad_y = letterbox.pad_y;
+            let inv_scale = letterbox.inv_scale;
+            let in_w_3 = in_w * 3;
+            
+            // Get raw pointers for unchecked access
+            let r_lut_ptr = r_lut.as_ptr();
+            let g_lut_ptr = g_lut.as_ptr();
+            let b_lut_ptr = b_lut.as_ptr();
+            let x_offsets_ptr = x_offsets.as_ptr();
+
+            // Write real pixels with ImageNet normalization using LUTs
             for y in 0..letterbox.new_height {
-                let src_y = ((y as f32 * letterbox.inv_scale) as u32).min(in_h - 1);
-                let src_row_offset = src_y * in_w * 3;
-                let dst_y = y + letterbox.pad_y;
-
-                for x in 0..letterbox.new_width {
-                    let src_idx = (src_row_offset + x_offsets[x as usize]) as usize;
-                    let dst_idx = (dst_y * target_w + (x + letterbox.pad_x)) as usize;
-
+                let src_y = ((y as f32 * inv_scale) as u32).min(in_h - 1);
+                let src_row_offset = src_y * in_w_3;
+                let dst_row_base = (y + pad_y) * target_w + pad_x;
+                
+                let width = letterbox.new_width;
+                let mut x = 0;
+                
+                // Process 4 pixels at a time (loop unrolling)
+                while x + 4 <= width {
                     unsafe {
-                        let r_norm = (norm_lut_f32[*in_ptr.add(src_idx) as usize] - r_mean) * r_std_inv;
-                        let g_norm = (norm_lut_f32[*in_ptr.add(src_idx + 1) as usize] - g_mean) * g_std_inv;
-                        let b_norm = (norm_lut_f32[*in_ptr.add(src_idx + 2) as usize] - b_mean) * b_std_inv;
-
-                        out_r[dst_idx] = get_f32_to_f16_lut(r_norm);
-                        out_g[dst_idx] = get_f32_to_f16_lut(g_norm);
-                        out_b[dst_idx] = get_f32_to_f16_lut(b_norm);
+                        let x0_offset = *x_offsets_ptr.add(x as usize);
+                        let x1_offset = *x_offsets_ptr.add((x + 1) as usize);
+                        let x2_offset = *x_offsets_ptr.add((x + 2) as usize);
+                        let x3_offset = *x_offsets_ptr.add((x + 3) as usize);
+                        
+                        let src_idx0 = (src_row_offset + x0_offset) as usize;
+                        let src_idx1 = (src_row_offset + x1_offset) as usize;
+                        let src_idx2 = (src_row_offset + x2_offset) as usize;
+                        let src_idx3 = (src_row_offset + x3_offset) as usize;
+                        
+                        let dst_idx0 = (dst_row_base + x) as usize;
+                        let dst_idx1 = (dst_row_base + x + 1) as usize;
+                        let dst_idx2 = (dst_row_base + x + 2) as usize;
+                        let dst_idx3 = (dst_row_base + x + 3) as usize;
+                        
+                        // Pixel 0
+                        *out_r.get_unchecked_mut(dst_idx0) = *r_lut_ptr.add(*in_ptr.add(src_idx0) as usize);
+                        *out_g.get_unchecked_mut(dst_idx0) = *g_lut_ptr.add(*in_ptr.add(src_idx0 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx0) = *b_lut_ptr.add(*in_ptr.add(src_idx0 + 2) as usize);
+                        
+                        // Pixel 1
+                        *out_r.get_unchecked_mut(dst_idx1) = *r_lut_ptr.add(*in_ptr.add(src_idx1) as usize);
+                        *out_g.get_unchecked_mut(dst_idx1) = *g_lut_ptr.add(*in_ptr.add(src_idx1 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx1) = *b_lut_ptr.add(*in_ptr.add(src_idx1 + 2) as usize);
+                        
+                        // Pixel 2
+                        *out_r.get_unchecked_mut(dst_idx2) = *r_lut_ptr.add(*in_ptr.add(src_idx2) as usize);
+                        *out_g.get_unchecked_mut(dst_idx2) = *g_lut_ptr.add(*in_ptr.add(src_idx2 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx2) = *b_lut_ptr.add(*in_ptr.add(src_idx2 + 2) as usize);
+                        
+                        // Pixel 3
+                        *out_r.get_unchecked_mut(dst_idx3) = *r_lut_ptr.add(*in_ptr.add(src_idx3) as usize);
+                        *out_g.get_unchecked_mut(dst_idx3) = *g_lut_ptr.add(*in_ptr.add(src_idx3 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx3) = *b_lut_ptr.add(*in_ptr.add(src_idx3 + 2) as usize);
                     }
+                    x += 4;
+                }
+                
+                // Handle remaining pixels
+                while x < width {
+                    unsafe {
+                        let x_offset = *x_offsets_ptr.add(x as usize);
+                        let src_idx = (src_row_offset + x_offset) as usize;
+                        let dst_idx = (dst_row_base + x) as usize;
+                        
+                        *out_r.get_unchecked_mut(dst_idx) = *r_lut_ptr.add(*in_ptr.add(src_idx) as usize);
+                        *out_g.get_unchecked_mut(dst_idx) = *g_lut_ptr.add(*in_ptr.add(src_idx + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx) = *b_lut_ptr.add(*in_ptr.add(src_idx + 2) as usize);
+                    }
+                    x += 1;
                 }
             }
         }
         InferencePrecision::FP32 => {
+            // Get pre-computed ImageNet normalization LUTs
+            let r_lut = get_imagenet_r_f32_lut();
+            let g_lut = get_imagenet_g_f32_lut();
+            let b_lut = get_imagenet_b_f32_lut();
+            
+            let pad_val_r = r_lut[PAD_GRAY_COLOR];
+            let pad_val_g = g_lut[PAD_GRAY_COLOR];
+            let pad_val_b = b_lut[PAD_GRAY_COLOR];
+            
             let out_ptr = output.as_mut_ptr() as *mut f32;
             let (out_r, out_g, out_b) = unsafe {
                 (
@@ -485,21 +634,80 @@ pub fn resize_letterbox_and_normalize_imagenet(
             out_g.fill(pad_val_g);
             out_b.fill(pad_val_b);
 
-            // Write real pixels with ImageNet normalization
+            // Hoist constants
+            let pad_x = letterbox.pad_x;
+            let pad_y = letterbox.pad_y;
+            let inv_scale = letterbox.inv_scale;
+            let in_w_3 = in_w * 3;
+            
+            // Get raw pointers for unchecked access
+            let r_lut_ptr = r_lut.as_ptr();
+            let g_lut_ptr = g_lut.as_ptr();
+            let b_lut_ptr = b_lut.as_ptr();
+            let x_offsets_ptr = x_offsets.as_ptr();
+
+            // Write real pixels with ImageNet normalization using LUTs
             for y in 0..letterbox.new_height {
-                let src_y = ((y as f32 * letterbox.inv_scale) as u32).min(in_h - 1);
-                let src_row_offset = src_y * in_w * 3;
-                let dst_y = y + letterbox.pad_y;
-
-                for x in 0..letterbox.new_width {
-                    let src_idx = (src_row_offset + x_offsets[x as usize]) as usize;
-                    let dst_idx = (dst_y * target_w + (x + letterbox.pad_x)) as usize;
-
+                let src_y = ((y as f32 * inv_scale) as u32).min(in_h - 1);
+                let src_row_offset = src_y * in_w_3;
+                let dst_row_base = (y + pad_y) * target_w + pad_x;
+                
+                let width = letterbox.new_width;
+                let mut x = 0;
+                
+                // Process 4 pixels at a time (loop unrolling)
+                while x + 4 <= width {
                     unsafe {
-                        out_r[dst_idx] = (norm_lut_f32[*in_ptr.add(src_idx) as usize] - r_mean) * r_std_inv;
-                        out_g[dst_idx] = (norm_lut_f32[*in_ptr.add(src_idx + 1) as usize] - g_mean) * g_std_inv;
-                        out_b[dst_idx] = (norm_lut_f32[*in_ptr.add(src_idx + 2) as usize] - b_mean) * b_std_inv;
+                        let x0_offset = *x_offsets_ptr.add(x as usize);
+                        let x1_offset = *x_offsets_ptr.add((x + 1) as usize);
+                        let x2_offset = *x_offsets_ptr.add((x + 2) as usize);
+                        let x3_offset = *x_offsets_ptr.add((x + 3) as usize);
+                        
+                        let src_idx0 = (src_row_offset + x0_offset) as usize;
+                        let src_idx1 = (src_row_offset + x1_offset) as usize;
+                        let src_idx2 = (src_row_offset + x2_offset) as usize;
+                        let src_idx3 = (src_row_offset + x3_offset) as usize;
+                        
+                        let dst_idx0 = (dst_row_base + x) as usize;
+                        let dst_idx1 = (dst_row_base + x + 1) as usize;
+                        let dst_idx2 = (dst_row_base + x + 2) as usize;
+                        let dst_idx3 = (dst_row_base + x + 3) as usize;
+                        
+                        // Pixel 0
+                        *out_r.get_unchecked_mut(dst_idx0) = *r_lut_ptr.add(*in_ptr.add(src_idx0) as usize);
+                        *out_g.get_unchecked_mut(dst_idx0) = *g_lut_ptr.add(*in_ptr.add(src_idx0 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx0) = *b_lut_ptr.add(*in_ptr.add(src_idx0 + 2) as usize);
+                        
+                        // Pixel 1
+                        *out_r.get_unchecked_mut(dst_idx1) = *r_lut_ptr.add(*in_ptr.add(src_idx1) as usize);
+                        *out_g.get_unchecked_mut(dst_idx1) = *g_lut_ptr.add(*in_ptr.add(src_idx1 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx1) = *b_lut_ptr.add(*in_ptr.add(src_idx1 + 2) as usize);
+                        
+                        // Pixel 2
+                        *out_r.get_unchecked_mut(dst_idx2) = *r_lut_ptr.add(*in_ptr.add(src_idx2) as usize);
+                        *out_g.get_unchecked_mut(dst_idx2) = *g_lut_ptr.add(*in_ptr.add(src_idx2 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx2) = *b_lut_ptr.add(*in_ptr.add(src_idx2 + 2) as usize);
+                        
+                        // Pixel 3
+                        *out_r.get_unchecked_mut(dst_idx3) = *r_lut_ptr.add(*in_ptr.add(src_idx3) as usize);
+                        *out_g.get_unchecked_mut(dst_idx3) = *g_lut_ptr.add(*in_ptr.add(src_idx3 + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx3) = *b_lut_ptr.add(*in_ptr.add(src_idx3 + 2) as usize);
                     }
+                    x += 4;
+                }
+                
+                // Handle remaining pixels
+                while x < width {
+                    unsafe {
+                        let x_offset = *x_offsets_ptr.add(x as usize);
+                        let src_idx = (src_row_offset + x_offset) as usize;
+                        let dst_idx = (dst_row_base + x) as usize;
+                        
+                        *out_r.get_unchecked_mut(dst_idx) = *r_lut_ptr.add(*in_ptr.add(src_idx) as usize);
+                        *out_g.get_unchecked_mut(dst_idx) = *g_lut_ptr.add(*in_ptr.add(src_idx + 1) as usize);
+                        *out_b.get_unchecked_mut(dst_idx) = *b_lut_ptr.add(*in_ptr.add(src_idx + 2) as usize);
+                    }
+                    x += 1;
                 }
             }
         }
