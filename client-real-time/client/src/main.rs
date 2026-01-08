@@ -18,27 +18,27 @@ async fn main() -> Result<()> {
         .await
         .context("Error initializing tokio runtime")?;
 
-    // elastic::init_elastic(&app_config)
-    //     .await
-    //     .context("Error initiating elastic")?;
+    elastic::init_elastic(&app_config)
+        .await
+        .context("Error initiating elastic")?;
 
-    // // Initiate inference client
-    // inference::init_inference_models(&app_config)
-    //     .await
-    //     .context("Error initiating inference model")?;
+    // Initiate inference client
+    inference::init_inference_models(&app_config)
+        .await
+        .context("Error initiating inference model")?;
 
-    // inference::start_models_instances(&app_config)
-    //     .await
-    //     .context("Error initiating inference model instances")?;
+    inference::start_models_instances(&app_config)
+        .await
+        .context("Error initiating inference model instances")?;
 
-    // // Initiate sources processors
-    // source::init_source_processors(&app_config)
-    //     .await
-    //     .context("Error initiating source processors")?;
+    // Initiate sources processors
+    source::init_source_processors(&app_config)
+        .await
+        .context("Error initiating source processors")?;
 
-    // // Initiate statistics
-    // statistics::init_statistics()
-    //     .context("Error initiating statistics")?;
+    // Initiate statistics
+    statistics::init_statistics()
+        .context("Error initiating statistics")?;
 
     // Start receiving frames from sources
     client_video::init_client_video()

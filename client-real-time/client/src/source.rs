@@ -316,7 +316,7 @@ impl SourceProcessor {
                 if bboxes.len() > 0 {
                     let bboxes = Arc::new(bboxes);
 
-                    let dino_bbox_model = inference::get_inference_model(InferenceModelType::DINO_BBOXES)?;
+                    let dino_bbox_model = inference::get_inference_model(InferenceModelType::DINO_OBJECTS)?;
                     let dino_bbox_frame = Arc::clone(&frame);
                     let dino_bbox_bboxes = Arc::clone(&bboxes);
                 

@@ -17,9 +17,10 @@ use crate::utils::config::InferencePrecision;
 /// 2. Normalizes pixels from 0-255 to 0-1
 /// 3. Converting raw pixel values to required precision datatype
 /// 4. Outputs raw bytes ordered by color channels(Planar): \[RRRBBBGGG\]
-pub fn preprocess(
+pub fn preprocess_frame(
     frame: &RawFrame,
     precision: InferencePrecision,
+    target_size: u32
 ) -> Result<Vec<u8>> {
     // Validate input
     let frame_target_size = (frame.height * frame.width * 3) as usize;
@@ -32,13 +33,12 @@ pub fn preprocess(
     }
 
     // Preprocess with letterbox resize + YOLO normalization
-    const TARGET_SIZE: u32 = 640;
     processing::resize_letterbox_and_normalize(
         &frame.data,
         frame.height,
         frame.width,
-        TARGET_SIZE,
-        TARGET_SIZE,
+        target_size,
+        target_size,
         precision
     )
 }
@@ -114,23 +114,15 @@ fn bbox_nms(detections: &mut Vec<ResultBBOX>, nms_threshold: f32) {
 pub fn postprocess(
     results: &[u8],
     original_frame: &RawFrame,
-    output_shape: &[i64],
+    target_size: u32,
+    target_features: u32,
     precision: InferencePrecision,
     pred_conf_threshold: f32,
     nms_iou_threshold: f32,
 ) -> Result<Vec<ResultBBOX>> {
-    // Validate model output shape
-    if output_shape.len() != 2 {
-        anyhow::bail!(
-            format!(
-                "Got unexpected size of model output shape. Got {}, expected 2",
-                output_shape.len()
-            )
-        );
-    }
-
-    let target_features = output_shape[0] as u32;
-    let target_anchors = output_shape[1] as u32;
+    // It's always contstant amount of anchors for YOLO models: nX8400
+    // Where n is the number of feature maps
+    let target_anchors = 8400 as u32;
     let target_classes = target_features - 4;
     
     // Validate size of output data
@@ -151,11 +143,10 @@ pub fn postprocess(
     }
     
     // Precompute letterbox parameters
-    const TARGET_SIZE: u32 = 640;
     let letterbox = processing::calculate_letterbox(
         original_frame.height, 
         original_frame.width, 
-        TARGET_SIZE
+        target_size
     );
     
     // Pre-allocate with exact capacity estimate (typically ~100-200 detections)
@@ -289,13 +280,17 @@ pub async fn process_frame(
     frame: Arc<RawFrame>
 ) -> Result<(FrameProcessStats, Vec<ResultBBOX>)> {
     let processing_start = Instant::now();
+    let target_size = inference_model.model_config()
+        .input_shape.last()
+        .ok_or(anyhow::anyhow!("Invalid input shape"))?
+        .clone() as u32;
 
     // Pre process
     let measure_start = Instant::now();
-    let precision = inference_model.model_config().precision;
     let frame_clone = Arc::clone(&frame);
+    let precision = inference_model.model_config().precision;
     let pre_frame = tokio::task::spawn_blocking(move || {
-        preprocess(&frame_clone, precision)
+        preprocess_frame(&frame_clone, precision, target_size)
     })
         .await
         .context("Preprocess task failed")?
@@ -316,15 +311,19 @@ pub async fn process_frame(
 
     // Post process
     let measure_start = Instant::now();
-    let post_output_shape = inference_model.model_config().output_shape.clone();
     let post_conf_threshold = source_config.conf_threshold;
     let post_nms_iou_threshold = source_config.nms_iou_threshold;
+    let target_features = inference_model.model_config()
+        .output_shape.first()
+        .ok_or(anyhow::anyhow!("Invalid output shape"))?
+        .clone() as u32;
     
     let bboxes = tokio::task::spawn_blocking(move || {
         postprocess(
             &raw_results, 
             &frame,
-            &post_output_shape,
+            target_size,
+            target_features,
             precision,
             post_conf_threshold,
             post_nms_iou_threshold

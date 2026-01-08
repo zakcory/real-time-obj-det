@@ -9,22 +9,23 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use serde_yaml;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use std::str::FromStr;
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 pub enum SearchType {
-    FAST,
+    LIGHT,
     MEDIUM,
-    DEEP
+    HEAVY
 }
 
-impl std::str::FromStr for SearchType {
+impl FromStr for SearchType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
-            "FAST" => Ok(SearchType::FAST),
+            "LIGHT" => Ok(SearchType::LIGHT),
             "MEDIUM" => Ok(SearchType::MEDIUM),
-            "DEEP" => Ok(SearchType::DEEP),
+            "HEAVY" => Ok(SearchType::HEAVY),
             _ => Err(format!("Invalid search type: {}", s))
         }
     }
@@ -78,23 +79,37 @@ pub enum InferencePrecision {
 impl InferencePrecision {
     pub fn to_string(&self) -> String {
         match self {
-            InferencePrecision::FP32 => "FP32",
-            InferencePrecision::FP16 => "FP16",
-        }.to_string()
+            InferencePrecision::FP32 => "FP32".to_string(),
+            InferencePrecision::FP16 => "FP16".to_string(),
+        }
     }
 }
 
 /// Represents type of inference model
-#[derive(PartialEq, Eq, Hash, Clone, Debug, Deserialize)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Deserialize, ToSchema)]
 #[allow(non_camel_case_types)]
 pub enum InferenceModelType {
-    DINO
+    SCENE,
+    OBJECTS
 }
 
 impl InferenceModelType {
-    pub fn to_string(&self) -> &'static str {
+    pub fn to_string(&self) -> String {
         match self {
-            InferenceModelType::DINO => "DINO"
+            InferenceModelType::SCENE => "SCENE".to_string(),
+            InferenceModelType::OBJECTS => "OBJECTS".to_string()
+        }
+    }
+}
+
+impl FromStr for InferenceModelType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "SCENE" => Ok(InferenceModelType::SCENE),
+            "OBJECTS" => Ok(InferenceModelType::OBJECTS),
+            _ => Err(format!("Invalid inference model type: {}", s))
         }
     }
 }

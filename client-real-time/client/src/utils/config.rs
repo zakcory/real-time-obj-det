@@ -73,9 +73,9 @@ pub enum InferencePrecision {
 impl InferencePrecision {
     pub fn to_string(&self) -> String {
         match self {
-            InferencePrecision::FP32 => "FP32",
-            InferencePrecision::FP16 => "FP16",
-        }.to_string()
+            InferencePrecision::FP32 => "FP32".to_string(),
+            InferencePrecision::FP16 => "FP16".to_string(),
+        }
     }
 }
 
@@ -85,15 +85,15 @@ impl InferencePrecision {
 pub enum InferenceModelType {
     YOLO,
     DINO,
-    DINO_BBOXES
+    DINO_OBJECTS
 }
 
 impl InferenceModelType {
-    pub fn to_string(&self) -> &'static str {
+    pub fn to_string(&self) -> String {
         match self {
-            InferenceModelType::YOLO => "YOLO",
-            InferenceModelType::DINO => "DINO",
-            InferenceModelType::DINO_BBOXES => "DINO_BBOXES"
+            InferenceModelType::YOLO => "YOLO".to_string(),
+            InferenceModelType::DINO => "DINO".to_string(),
+            InferenceModelType::DINO_OBJECTS => "DINO_OBJECTS".to_string()
         }
     }
 }

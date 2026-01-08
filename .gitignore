@@ -71,6 +71,13 @@ htmlcov/
 *.tar
 *.gz
 
+# models
+*.onnx
+*.trt
+*.engine
+*.pt
+*.pth
+
 # Project-specific
 sources/
 *Cargo.lock

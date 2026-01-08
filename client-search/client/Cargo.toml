@@ -12,12 +12,15 @@ tracing-appender = "0.2.3"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter", "time"] }
 triton-client = "0.2.0"
-image = "0.25.6"
 chrono = "0.4.42"
 nvml-wrapper = "0.11.0"
 serde_yaml = "0.9.34"
 futures = "0.3.31"
 elasticsearch = "9.1.0-alpha.1"
+zune-jpeg = "0.4"
+zune-png = "0.4"
+zune-core = "0.4"
+image = "0.25"  # keep for fallback
 
 # API dependencies
 utoipa = { version = "5.4.0", features = ["axum_extras"] }

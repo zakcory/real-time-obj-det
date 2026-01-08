@@ -1,4 +1,4 @@
-use axum::{Router};
+use axum::{Router, extract::DefaultBodyLimit};
 use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use anyhow::{Result, Context};
@@ -8,12 +8,17 @@ use client::utils::config::AppConfig;
 use client::statistics;
 use client::handlers;
 use client::inference;
+use client::utils::elastic;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Iniaitlize config
     let app_config = AppConfig::new()
         .context("Error loading config")?;
+
+    elastic::init_elastic(&app_config)
+        .await
+        .context("Error initiating elastic")?;
 
     // Initiate inference client
     inference::init_inference_models(&app_config)
@@ -32,7 +37,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(handlers::routes())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)); // 50MB limit
 
     // Register port for application
     let addr = SocketAddr::from((

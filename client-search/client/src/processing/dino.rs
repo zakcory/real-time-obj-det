@@ -17,6 +17,7 @@ use crate::utils::config::InferencePrecision;
 pub fn preprocess_frame(
     frame: &RawFrame,
     precision: InferencePrecision,
+    target_size: u32,
 ) -> Result<Vec<u8>> {
     // Validate input
     let frame_target_size = (frame.height * frame.width * 3) as usize;
@@ -29,13 +30,12 @@ pub fn preprocess_frame(
     }
 
     // Preprocess with letterbox resize + ImageNet normalization
-    const TARGET_SIZE: u32 = 224;
     processing::resize_letterbox_and_normalize_imagenet(
         &frame.data,
         frame.height,
         frame.width,
-        TARGET_SIZE,
-        TARGET_SIZE,
+        target_size,
+        target_size,
         precision
     )
 }
@@ -93,13 +93,17 @@ pub async fn process_frame(
     frame: Arc<RawFrame>
 ) -> Result<(FrameProcessStats, ResultEmbedding)> {
     let processing_start = Instant::now();
+    let target_size = inference_model.model_config()
+        .input_shape.last()
+        .ok_or(anyhow::anyhow!("Invalid input shape"))?
+        .clone() as u32;
 
     // Pre process
     let measure_start = Instant::now();
-    let precision = inference_model.model_config().precision;
     let frame_clone = Arc::clone(&frame);
+    let precision = inference_model.model_config().precision;
     let pre_frame = tokio::task::spawn_blocking(move || {
-        preprocess_frame(&frame_clone, precision)
+        preprocess_frame(&frame_clone, precision, target_size)
     })
         .await
         .context("Preprocess task failed")?

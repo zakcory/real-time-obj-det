@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use anyhow::{Context, Result};
 use elasticsearch::{Elasticsearch, http::transport::Transport};
-use serde_json::{json, Value};
+use serde_json::json;
 
 // Custom modules
-use crate::utils::config::{ElasticConfig, AppConfig, SearchConfigOption};
+use crate::utils::config::{ElasticConfig, AppConfig, SearchType, SearchConfigOption};
 use crate::processing::ResultEmbedding;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -30,7 +31,8 @@ pub async fn init_elastic(app_config: &AppConfig) -> Result<()> {
 
     // Create new instance
     let elastic_instance = Elastic::new(
-        app_config.elastic_config().clone()
+        app_config.elastic_config().clone(),
+        app_config.search_config().clone()
     )
         .context("Error creating new Elastic client")?;
 
@@ -43,37 +45,46 @@ pub async fn init_elastic(app_config: &AppConfig) -> Result<()> {
 
 pub struct Elastic {
     client: Elasticsearch,
-    config: ElasticConfig
+    elastic_config: ElasticConfig,
+    search_config: HashMap<SearchType, SearchConfigOption>
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct SearchMetadata {
     pub channel_ids: Option<Vec<String>>,
     pub timestamp_start: Option<i64>,
-    pub timestamp_end: Option<i64>,
+    pub timestamp_end: Option<i64>
 }
 
 impl Elastic {
     /// Creates a new Elastic client instance
-    pub fn new(config: ElasticConfig) -> Result<Self> {
-        let transport = Transport::single_node(&config.url)
+    pub fn new(
+        elastic_config: ElasticConfig, 
+        search_config: HashMap<SearchType, SearchConfigOption>
+    ) -> Result<Self> {
+        let transport = Transport::single_node(&elastic_config.url)
             .context("Failed to create Elastic transport")?;
         
         let client = Elasticsearch::new(transport);
 
         Ok(Self {
             client,
-            config
+            elastic_config,
+            search_config
         })
     }
 
     /// Performs a KNN search on the index with the given embedding and configuration
     pub async fn search_disk_bbq(
         embedding: ResultEmbedding,
-        search_config: &SearchConfigOption,
+        search_type: SearchType,
         metadata: SearchMetadata
-    ) -> Result<Value> {
+    ) -> Result<Vec<serde_json::Value>> {
         let elastic = get_elastic()?;
+
+        // Determine search configuration
+        let search_config = elastic.search_config.get(&search_type)
+            .context("Search configuration not found")?;
 
         let mut must_clauses = Vec::new();
 
@@ -142,15 +153,21 @@ impl Elastic {
         });
 
         let response = elastic.client
-            .search(elasticsearch::SearchParts::Index(&[&elastic.config.index_name]))
+            .search(elasticsearch::SearchParts::Index(&[&elastic.elastic_config.index_name]))
             .body(body)
             .send()
             .await
             .context("Failed to execute search request")?;
 
-        let response_body = response.json::<Value>().await
+        let response_body = response.json::<serde_json::Value>().await
             .context("Failed to parse search response")?;
 
-        Ok(response_body)
+        // Return search results
+        let hits = response_body["hits"]["hits"]
+            .as_array()
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+
+        Ok(hits)
     }
 }

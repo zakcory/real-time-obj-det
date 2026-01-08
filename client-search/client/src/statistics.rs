@@ -5,10 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 
 // Variables
-pub static PROCESSING_STATS_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1000);
+pub static PROCESSING_STATS_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 pub static GPU_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1000);
 
-pub static STATISTICS: OnceLock<Statistics> = OnceLock::new();
+pub static STATISTICS: OnceLock<Arc<Statistics>> = OnceLock::new();
 
 pub fn init_statistics() -> Result<()> {
     if let Some(_) = STATISTICS.get() {
@@ -18,10 +18,15 @@ pub fn init_statistics() -> Result<()> {
     let statistics = Statistics::new()
         .context("Error creating statistics object")?;
 
-    STATISTICS.set(statistics)
+    STATISTICS.set(Arc::new(statistics))
         .map_err(|_| anyhow::anyhow!("Error setting statistics object"))?;
     
     Ok(())
+}
+
+pub fn get_statistics() -> Result<Arc<Statistics>> {
+    STATISTICS.get().cloned()
+        .context("Statistics not initialized!")
 }
 
 /// Represents GPU statistics that are reported by the application
@@ -37,12 +42,13 @@ pub struct GPUStats {
 }
 
 /// Responsible for giving information about times at specific parts of inference
+#[derive(Debug)]
 pub struct FrameProcessStats {
     pub queue: u64,
     pub pre_processing: u64,
     pub inference: u64,
     pub post_processing: u64,
-    pub results: u64,
+    pub search: u64,
     pub processing: u64
 }
 
@@ -53,7 +59,7 @@ impl Default for FrameProcessStats {
             pre_processing: 0,
             inference: 0,
             post_processing: 0,
-            results: 0,
+            search: 0,
             processing: 0
         }
     }
@@ -65,59 +71,51 @@ impl FrameProcessStats {
         self.pre_processing += other.pre_processing;
         self.inference += other.inference;
         self.post_processing += other.post_processing;
-        self.results += other.results;
+        self.search += other.search;
         self.processing += other.processing;
     }
 }
 
 pub struct ProcessingStats {
-    pub frames_total: AtomicU64,
-    pub frames_expected: AtomicU64,
     pub frames_success: AtomicU64,
-    pub frames_failed: AtomicU64,
     pub total_queue_time: AtomicU64,
     pub total_pre_proc_time: AtomicU64,
     pub total_inference_time: AtomicU64,
     pub total_post_proc_time: AtomicU64,
-    pub total_results_time: AtomicU64,
+    pub total_search_time: AtomicU64,
     pub total_processing_time: AtomicU64
 }
 
 impl ProcessingStats {
     pub fn new() -> Self {
         Self {
-            frames_total: AtomicU64::new(0),
-            frames_expected: AtomicU64::new(0),
             frames_success: AtomicU64::new(0),
-            frames_failed: AtomicU64::new(0),
             total_queue_time: AtomicU64::new(0),
             total_pre_proc_time: AtomicU64::new(0),
             total_inference_time: AtomicU64::new(0),
             total_post_proc_time: AtomicU64::new(0),
-            total_results_time: AtomicU64::new(0),
+            total_search_time: AtomicU64::new(0),
             total_processing_time: AtomicU64::new(0)
         }
     }
 
     pub fn reset(&self) {
-        self.frames_total.store(0, Ordering::Relaxed);
-        self.frames_expected.store(0, Ordering::Relaxed);
         self.frames_success.store(0, Ordering::Relaxed);
-        self.frames_failed.store(0, Ordering::Relaxed);
         self.total_queue_time.store(0, Ordering::Relaxed);
         self.total_pre_proc_time.store(0, Ordering::Relaxed);
         self.total_inference_time.store(0, Ordering::Relaxed);
         self.total_post_proc_time.store(0, Ordering::Relaxed);
-        self.total_results_time.store(0, Ordering::Relaxed);
+        self.total_search_time.store(0, Ordering::Relaxed);
         self.total_processing_time.store(0, Ordering::Relaxed);
     }
 
     pub fn accumulate(&self, stats: &FrameProcessStats) {
+        self.frames_success.fetch_add(1, Ordering::Relaxed);
         self.total_queue_time.fetch_add(stats.queue, Ordering::Relaxed);
         self.total_pre_proc_time.fetch_add(stats.pre_processing, Ordering::Relaxed);
         self.total_inference_time.fetch_add(stats.inference, Ordering::Relaxed);
         self.total_post_proc_time.fetch_add(stats.post_processing, Ordering::Relaxed);
-        self.total_results_time.fetch_add(stats.results, Ordering::Relaxed);
+        self.total_search_time.fetch_add(stats.search, Ordering::Relaxed);
         self.total_processing_time.fetch_add(stats.processing, Ordering::Relaxed);
     }
 }
@@ -249,19 +247,16 @@ impl Statistics {
         let mut avg_pre_proc: f64 = 0.00;
         let mut avg_inference: f64 = 0.00;
         let mut avg_post_proc: f64 = 0.00;
-        let mut avg_results: f64 = 0.00;
+        let mut avg_search: f64 = 0.00;
         let mut avg_processing: f64 = 0.00;
 
         // Extract values of statistics
-        let frames_total = processing_stats.frames_total.load(Ordering::Relaxed);
-        let frames_expected = processing_stats.frames_expected.load(Ordering::Relaxed);
         let frames_success = processing_stats.frames_success.load(Ordering::Relaxed);
-        let frames_failed = processing_stats.frames_failed.load(Ordering::Relaxed);
         let total_queue_time = processing_stats.total_queue_time.load(Ordering::Relaxed);
         let total_pre_proc_time = processing_stats.total_pre_proc_time.load(Ordering::Relaxed);
         let total_inference_time = processing_stats.total_inference_time.load(Ordering::Relaxed);
         let total_post_proc_time = processing_stats.total_post_proc_time.load(Ordering::Relaxed);
-        let total_results_time = processing_stats.total_results_time.load(Ordering::Relaxed);
+        let total_search_time = processing_stats.total_search_time.load(Ordering::Relaxed);
         let total_processing_time = processing_stats.total_processing_time.load(Ordering::Relaxed);
         
         if frames_success > 0 {
@@ -269,20 +264,17 @@ impl Statistics {
             avg_pre_proc = (total_pre_proc_time as f64) / (frames_success as f64);
             avg_inference = (total_inference_time as f64) / (frames_success as f64);
             avg_post_proc = (total_post_proc_time as f64) / (frames_success as f64);
-            avg_results = (total_results_time as f64) / (frames_success as f64);
+            avg_search = (total_search_time as f64) / (frames_success as f64);
             avg_processing = (total_processing_time as f64) / (frames_success as f64);
         }
 
         tracing::info!(
-            frames_total=frames_total,
-            frames_expected=frames_expected,
             frames_success=frames_success,
-            frames_failed=frames_failed,
             avg_queue=avg_queue,
             avg_pre_proc=avg_pre_proc,
             avg_inference=avg_inference,
             avg_post_proc=avg_post_proc,
-            avg_results=avg_results,
+            avg_search=avg_search,
             avg_processing=avg_processing,
             "processing statistics"
         );
