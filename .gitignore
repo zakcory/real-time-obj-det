@@ -43,6 +43,14 @@ Thumbs.db
 *.swp
 *.swo
 
+# UV files
+*uv.lock
+
+# NPM
+*node_modules/
+*package-lock.json
+*yarn.lock
+
 # Temporary files
 *.tmp
 *.temp
@@ -63,15 +71,17 @@ htmlcov/
 *.tar
 *.gz
 
+# models
+*.onnx
+*.trt
+*.engine
+*.pt
+*.pth
+
 # Project-specific
-models/
 sources/
 *Cargo.lock
 *target/
 *triton_logs/
 *triton_models/
-video-player/library/dependencies/
-*.mp4
 *.so
-*.mpd
-*.m4s

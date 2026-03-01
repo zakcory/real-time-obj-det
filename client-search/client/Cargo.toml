@@ -1,0 +1,30 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+anyhow = "1.0.99"
+tracing-appender = "0.2.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter", "time"] }
+triton-client = "0.2.0"
+chrono = "0.4.42"
+nvml-wrapper = "0.11.0"
+serde_yaml = "0.9.34"
+futures = "0.3.31"
+elasticsearch = "9.1.0-alpha.1"
+zune-jpeg = "0.4"
+zune-png = "0.4"
+zune-core = "0.4"
+image = "0.25"  # keep for fallback
+
+# API dependencies
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+axum = {version = "0.8.4", features = ["macros", "multipart"] }

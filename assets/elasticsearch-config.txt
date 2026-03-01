@@ -1,0 +1,70 @@
+PUT _component_template/embedding-live-object-template
+{
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "embeddings-phasing-policy",
+      "index.lifecycle.rollover_alias": "embeddings-live",
+      "index.codec": "best_compression",
+      "number_of_shards": 2,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "timestamp": {
+          "type": "date",
+          "format": "epoch_millis"
+        },
+        "channel_id": {
+          "type": "keyword"
+        },
+        "embedding": {
+          "type": "dense_vector",
+          "dims": 768,
+          "element_type": "bfloat16",
+          "index": true,
+          "index_options": {
+            "type": "bbq_disk"
+          },
+          "similarity": "cosine"
+        }
+      }
+    }
+  }
+}
+
+PUT _index_template/embedding-live-template
+{
+  "template": {
+    "settings": {
+      "index": {
+        "lifecycle": {
+          "name": "embeddings-phasing-policy",
+          "rollover_alias": "embeddings-live"
+        },
+        "codec": "best_compression",
+        "number_of_shards": "2",
+        "number_of_replicas": "0",
+        "refresh_interval": "30s",
+        "mode": "standard"
+      }
+    },
+    "aliases": {
+      "embeddings_search": {}
+    }
+  },
+  "index_patterns": [
+    "embeddings-live-*"
+  ],
+  "composed_of": [
+    "embedding-live-object-template"
+  ]
+}
+
+PUT embeddings-live-000001
+{
+  "aliases": {
+    "embeddings-live": {
+      "is_write_index": true
+    }
+  }
+}

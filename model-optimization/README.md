@@ -8,17 +8,22 @@ The conversion will result with model_**fp16** and model_**fp32** files, which r
 Next, we would be converting the `.onnx` file we have to `.engine`, using NVIDIA's TensorRT tool.<br>
 TensorRT compiles a model for your specific achitecture(one used at time of compilation), therefore making it very efficient when running on your machine.<br>
 
+## Setting up the environment
+```bash
+uv sync
+```
+
 ## Pytorch to Onnx Conversion
 The following command is used for converting a model from Pytorch to Onnx:
 ```bash
 # YOLOV9
-python3.11 export_model.py \
+uv run export_model.py \
   --model_type YOLOV9 \
   --model_path MODEL.pt \
   --model-source-code ./yolov9/
 
 # DINOV3
-python3.11 export_model.py \
+uv run export_model.py \
   --model_type DINOV3 \
   --model_path MODEL.pt \
   --model-source-code ./dinov3/
@@ -70,3 +75,34 @@ To test performance of TRT model, use the following command:
   --loadEngine=CONVERTED.engine \
   --shapes=images:8x3x640x640 \
   --exportTimes=inference_times.json
+
+Dinov3 export:
+```bash
+# For TritonServer from 24.12+
+/usr/src/tensorrt/bin/trtexec \
+    --onnx=/yves/dinov3_vitb16-fp32-512.onnx \
+    --saveEngine=/yves/dinov3_512.engine \
+    --optShapes=images:8x3x512x512 \
+    --minShapes=images:1x3x512x512 \
+    --maxShapes=images:16x3x512x512 \
+    --inputIOFormats=fp16:chw \
+    --outputIOFormats=fp16:chw \
+    --fp16 \
+    --precisionConstraints=obey \
+    --layerPrecisions='.*Softmax.*':fp32,'.*LayerNorm.*':fp32,'.*rope_embed.*':fp32 
+
+# For TritonServer up to 24.12
+/usr/src/tensorrt/bin/trtexec     
+    --onnx=/yves/dinov3_vitb16-fp32-512.onnx     
+    --saveEngine=/yves/dinov3_512_perfect.engine     
+    --optShapes=images:8x3x512x512     
+    --minShapes=images:1x3x512x512     
+    --maxShapes=images:16x3x512x512     
+    --inputIOFormats=fp16:chw     
+    --outputIOFormats=fp16:chw     
+    --fp16     
+    --noTF32     
+    --precisionConstraints=obey     
+    --tacticSources=+cuBLAS,+cuBLAS_LT,+cuDNN     
+    --layerPrecisions='.*Softmax.*':fp32,'.*LayerNorm.*':fp32,'.*rope_embed.*':fp32,'.*attn.*':fp16,'.*mlp.*':fp16,'.*patch_embed.*':fp16,'*':fp32
+```

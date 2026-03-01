@@ -1,0 +1,11 @@
+[project]
+name = "model-optimization"
+version = "0.1.0"
+description = "Model optimization for production"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "onnx==1.18.0",
+    "onnxruntime-gpu==1.22.0",
+    "torch==2.7.1",
+]

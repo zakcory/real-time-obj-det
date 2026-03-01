@@ -4,10 +4,9 @@ import torch.onnx
 from pathlib import Path
 import os
 import onnx
-from onnxconverter_common import float16
 
 # Custom modules
-from export_utils import ModelType, get_dinov3_model, get_yolov9_model, remove_training_nodes, clean_unused_weights
+from export_utils import ModelType, get_dinov3_model, get_yolov9_model
 
 def export_model(
     model_name: str,
@@ -18,7 +17,7 @@ def export_model(
     output_name: str = "output"
 ) -> str:
     """
-    Exports a given model to ONNX format with both FP32 and FP16 versions.
+    Exports a given model to ONNX format with FP32 precision.
     """
     print(f"Exporting model: {model_name}")
 
@@ -30,10 +29,9 @@ def export_model(
     
     # Define output paths
     path_fp32 = os.path.join(output_path, f"{model_name}-fp32.onnx")
-    path_fp16 = os.path.join(output_path, f"{model_name}-fp16.onnx")
     
-    # Export to ONNX - FP32 (baseline)
-    print("Exporting FP32 baseline model...")
+    # Export to ONNX - FP32
+    print("Exporting FP32 model...")
     torch.onnx.export(
         model.float(),
         dummy_input.float(),
@@ -52,26 +50,6 @@ def export_model(
     )
     model_fp32 = onnx.load(path_fp32)
     print("FP32 export successful")
-
-    # Performing pre-conversion optimizations for FP16
-    print("Performing pre-conversion optimizations for FP16..")
-    model_fp32 = remove_training_nodes(model_fp32)
-    model_fp32 = clean_unused_weights(model_fp32)
-    
-    # Convert to FP16
-    print("Converting to FP16 precision...")
-    model_fp16 = float16.convert_float_to_float16(
-        model_fp32, 
-        keep_io_types=False,
-        disable_shape_infer=False
-    )
-
-    # Perform post-conversion optimizations for FP16
-    print("Performing post-conversion optimizations for FP16..")
-    model_fp16 = clean_unused_weights(model_fp16)
-
-    onnx.save(model_fp16, path_fp16)
-    print("FP16 export successful")
     
     # Validate and save
     try:
@@ -81,21 +59,9 @@ def export_model(
     except Exception as e:
         print(f"Model validation warning: {e}")
     
-    try:
-        model_fp16 = onnx.load(path_fp16)
-        onnx.checker.check_model(model_fp16)
-        print("FP16 Model validation: PASSED")
-    except Exception as e:
-        print(f"Model validation warning: {e}")
-    
-    # Calculate optimization results
+    # Calculate size of the model
     original_size = os.path.getsize(path_fp32) / (1024 * 1024)  # MB
-    optimized_size = os.path.getsize(path_fp16) / (1024 * 1024)  # MB
-    size_reduction = ((original_size - optimized_size) / original_size) * 100
-    
-    print(f"Exported base FP32 model to: {path_fp32}")
-    print(f"Exported optimized FP16 model to: {path_fp16}")
-    print(f"Size reduction: {original_size:.1f} MB → {optimized_size:.1f} MB ({size_reduction:.1f}% smaller)")
+    print(f"Exported FP32 model to: {path_fp32}, size {original_size:.1f} MB")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -132,6 +98,12 @@ def main():
         help='Output directory for .onnx models'
     )
     parser.add_argument(
+        '--input-shape',
+        type=str,
+        default='3,640,640',
+        help='Shape of input, seperated by comma (e.g. 3,640,640)'
+    )
+    parser.add_argument(
         '--input-name',
         type=str,
         default='images',
@@ -149,24 +121,30 @@ def main():
     # Load model to context
     model_type = ModelType[args.model_type]
     model = None
-    dummy_input = None
 
     if model_type == ModelType.DINOV3:
         if not args.dino_type:
             raise ValueError("DINOv3 model type must be specified with --dino-type")
         
-        model, dummy_input = get_dinov3_model(
+        model = get_dinov3_model(
             args.model_source_code,
             args.model_path,
             args.dino_type
         )
     elif model_type == ModelType.YOLOV9:
-        model, dummy_input = get_yolov9_model(
+        model = get_yolov9_model(
             args.model_source_code,
             args.model_path
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
+    
+    # Create dummy input
+    input_shape = tuple(map(int, args.input_shape.split(',')))
+    if len(input_shape) != 3:
+        raise Exception("Invalid input shape. Must be 3 dimensions (e.g. 3,640,640)")
+    
+    dummy_input = torch.randn(1, *input_shape)
     
     if model is None or dummy_input is None:
         raise Exception('Failed to load model or dummy input')
@@ -180,7 +158,6 @@ def main():
         args.input_name,
         args.output_name
     )
-
 
 if __name__ == '__main__':
     main()
