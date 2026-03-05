@@ -15,7 +15,14 @@ use tokio::sync::OnceCell;
 use anyhow::{self, Result, Context};
 
 // Custom modules
-use crate::utils::config::{AppConfig, ModelConfig, TritonConfig, InferenceModelType, InferencePrecision};
+use crate::utils::config::{
+    AppConfig,
+    InferenceDataType,
+    InferenceModelType,
+    ModelConfig,
+    ModelOutputConfig,
+    TritonConfig,
+};
 
 // Variables
 pub static INFERENCE_MODELS: OnceCell<HashMap<InferenceModelType, Arc<InferenceModel>>> = OnceCell::const_new();
@@ -62,12 +69,7 @@ pub async fn init_inference_models(app_config: &AppConfig) -> Result<()> {
 }
 
 pub async fn start_models_instances(app_config: &AppConfig) -> Result<()> {
-    // Calculate total "load units" - how much processing capacity we need
-    // Each source contributes fractional load based on its frame rate
-    let instances: u32 = app_config
-        .sources_config()
-        .sources
-        .len() as u32;
+    let instances = app_config.inference_config().instances;
 
     // Load same amount of instances for each model type
     for model_type in app_config.inference_config().models.keys() {
@@ -123,6 +125,8 @@ impl InferenceModel {
         // Create base inference request
         let mut batch_input_shape = Vec::with_capacity(&model_config.input_shape.len() + 1);
         batch_input_shape.extend(&model_config.input_shape);
+        let outputs = model_config.resolved_outputs()
+            .context("Error resolving model outputs")?;
 
         let base_request = ModelInferRequest {
             model_name: model_config.name.to_string(),
@@ -138,12 +142,10 @@ impl InferenceModel {
                     contents: None
                 }
             ],
-            outputs: vec![
-                InferRequestedOutputTensor {
-                    name: model_config.output_name.to_string(),
-                    parameters: HashMap::new(),
-                }
-            ],
+            outputs: outputs.into_iter().map(|output| InferRequestedOutputTensor {
+                name: output.name,
+                parameters: HashMap::new(),
+            }).collect(),
             raw_input_contents: Vec::new()
         };
 
@@ -171,6 +173,16 @@ impl InferenceModel {
     
     /// Loads given amount of instances of a given model
     pub async fn load_model(&self, instances: u32) -> Result<()> {
+        let outputs = self.resolved_outputs()
+            .context("Error resolving model outputs")?;
+        let outputs_json: Vec<_> = outputs.iter().map(|output| {
+            json!({
+                "name": output.name,
+                "data_type": output.data_type.to_string(),
+                "dims": output.shape
+            })
+        }).collect();
+
         let model_config = json!({
             "name": &self.model_config().name,
             "platform": "tensorrt_plan",
@@ -182,13 +194,7 @@ impl InferenceModel {
                     "dims": &self.model_config().input_shape
                 }
             ],
-            "output": [
-                {
-                    "name": &self.model_config().output_name,
-                    "data_type": format!("TYPE_{}", &self.model_config().precision.to_string()),
-                    "dims": &self.model_config().output_shape
-                }
-            ],
+            "output": outputs_json,
             "instance_group": [
                 {
                     "kind": "KIND_GPU",
@@ -260,16 +266,25 @@ impl InferenceModel {
     /// Performs inference on many raw inputs, returning raw model results
     /// Automatically batches requests up to max_batch_size and processes batches concurrently
     pub async fn infer(&self, raw_inputs: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+        let outputs = self.resolved_outputs()
+            .context("Error resolving model outputs")?;
+        if outputs.len() != 1 {
+            anyhow::bail!(
+                "infer() supports single-output models only. Model {} has {} outputs",
+                self.model_config.name,
+                outputs.len()
+            );
+        }
+        let single_output = outputs.into_iter().next()
+            .context("Missing output config")?;
+
         let max_batch_size = self.model_config.batch_max_size as usize;
-        let num_inputs = raw_inputs.len();        
+        let num_inputs = raw_inputs.len();
         // Calculate output size per sample once
-        let output_size_per_sample: usize = self.model_config.output_shape
+        let output_size_per_sample: usize = single_output.shape
             .iter()
             .map(|&dim| dim as usize)
-            .product::<usize>() * match self.model_config.precision {
-                InferencePrecision::FP16 => 2,
-                InferencePrecision::FP32 => 4,
-            };
+            .product::<usize>() * single_output.data_type.byte_size();
         
         // Pre-allocate result slots - direct placement, no sorting
         let mut all_results: Vec<Vec<u8>> = Vec::with_capacity(num_inputs);
@@ -377,9 +392,64 @@ impl InferenceModel {
 
         Ok(all_results)
     }
+
+    /// Performs inference for a single input on multi-output models (e.g. EfficientNMS YOLO)
+    pub async fn infer_one_multi(&self, raw_input: Vec<u8>) -> Result<HashMap<String, Vec<u8>>> {
+        let outputs = self.resolved_outputs()
+            .context("Error resolving model outputs")?;
+
+        let mut inference_request = self.base_request.clone();
+        inference_request.inputs[0].shape.insert(0, 1);
+        inference_request.raw_input_contents = vec![raw_input];
+
+        let inference_result = self.client.model_infer(inference_request)
+            .await
+            .context("Error sending triton inference request")?;
+
+        if inference_result.raw_output_contents.len() != outputs.len() {
+            anyhow::bail!(
+                "Unexpected number of inference outputs: got {}, expected {}",
+                inference_result.raw_output_contents.len(),
+                outputs.len()
+            );
+        }
+
+        let mut mapped_outputs = HashMap::with_capacity(outputs.len());
+        for (output_cfg, output_blob) in outputs.into_iter().zip(inference_result.raw_output_contents.into_iter()) {
+            let expected_size_per_sample = output_cfg.shape
+                .iter()
+                .map(|&dim| dim as usize)
+                .product::<usize>() * output_cfg.data_type.byte_size();
+
+            if output_blob.len() != expected_size_per_sample {
+                anyhow::bail!(
+                    "Unexpected output size for {}: got {}, expected {}",
+                    output_cfg.name,
+                    output_blob.len(),
+                    expected_size_per_sample
+                );
+            }
+
+            mapped_outputs.insert(output_cfg.name, output_blob);
+        }
+
+        Ok(mapped_outputs)
+    }
 }
 
 impl InferenceModel {
+    fn resolved_outputs(&self) -> Result<Vec<ModelOutputConfig>> {
+        self.model_config.resolved_outputs()
+    }
+
+    pub fn output_dtype(&self, output_name: &str) -> Result<InferenceDataType> {
+        let outputs = self.resolved_outputs()?;
+        outputs.into_iter()
+            .find(|output| output.name == output_name)
+            .map(|output| output.data_type)
+            .context("Requested output dtype does not exist in model config")
+    }
+
     pub fn client(&self) -> &Client {
         &self.client
     }

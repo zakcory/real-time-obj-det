@@ -134,7 +134,7 @@ pub struct Statistics {
 
 impl Statistics {
     pub fn new() -> Result<Self> {
-        let is_running = Arc::new(AtomicBool::new(false));
+        let is_running = Arc::new(AtomicBool::new(true));
 
         // Spawn an independent task to print source statistics
         let source_stats_is_running = Arc::clone(&is_running);

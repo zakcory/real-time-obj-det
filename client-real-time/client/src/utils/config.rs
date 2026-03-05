@@ -15,11 +15,22 @@ pub struct ModelConfig {
     pub precision: InferencePrecision,
     pub input_name: String,
     pub input_shape: Vec<i64>,
-    pub output_name: String,
-    pub output_shape: Vec<i64>,
+    #[serde(default)]
+    pub output_name: Option<String>,
+    #[serde(default)]
+    pub output_shape: Option<Vec<i64>>,
+    #[serde(default)]
+    pub outputs: Vec<ModelOutputConfig>,
     pub batch_max_size: u32,
     pub batch_max_queue_delay: u32,
     pub batch_preferred_sizes: Vec<u32>
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ModelOutputConfig {
+    pub name: String,
+    pub data_type: InferenceDataType,
+    pub shape: Vec<i64>
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,7 +71,8 @@ pub struct ElasticConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InferenceConfig {
     pub models: HashMap<InferenceModelType, ModelConfig>,
-    pub task: InferenceTask
+    pub task: InferenceTask,
+    pub instances: u32
 }
 
 /// Represents the inference model precision type
@@ -75,6 +87,32 @@ impl InferencePrecision {
         match self {
             InferencePrecision::FP32 => "FP32".to_string(),
             InferencePrecision::FP16 => "FP16".to_string(),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Deserialize)]
+#[allow(non_camel_case_types)]
+pub enum InferenceDataType {
+    TYPE_FP32,
+    TYPE_FP16,
+    TYPE_INT32
+}
+
+impl InferenceDataType {
+    pub fn to_string(&self) -> String {
+        match self {
+            InferenceDataType::TYPE_FP32 => "TYPE_FP32".to_string(),
+            InferenceDataType::TYPE_FP16 => "TYPE_FP16".to_string(),
+            InferenceDataType::TYPE_INT32 => "TYPE_INT32".to_string(),
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        match self {
+            InferenceDataType::TYPE_FP32 => 4,
+            InferenceDataType::TYPE_FP16 => 2,
+            InferenceDataType::TYPE_INT32 => 4,
         }
     }
 }
@@ -203,6 +241,34 @@ impl AppConfig {
             .init();
 
         std::mem::forget(_guard);
+    }
+}
+
+impl ModelConfig {
+    pub fn resolved_outputs(&self) -> Result<Vec<ModelOutputConfig>> {
+        if !self.outputs.is_empty() {
+            return Ok(self.outputs.clone());
+        }
+
+        let output_name = self.output_name
+            .clone()
+            .context("Missing model output_name configuration")?;
+        let output_shape = self.output_shape
+            .clone()
+            .context("Missing model output_shape configuration")?;
+
+        let data_type = match self.precision {
+            InferencePrecision::FP16 => InferenceDataType::TYPE_FP16,
+            InferencePrecision::FP32 => InferenceDataType::TYPE_FP32,
+        };
+
+        Ok(vec![
+            ModelOutputConfig {
+                name: output_name,
+                data_type,
+                shape: output_shape,
+            }
+        ])
     }
 }
 

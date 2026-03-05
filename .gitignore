@@ -85,3 +85,5 @@ sources/
 *triton_logs/
 *triton_models/
 *.so
+
+plots/*
