@@ -130,7 +130,7 @@ impl InferenceModel {
 
         let base_request = ModelInferRequest {
             model_name: model_config.name.to_string(),
-            model_version: "1".to_string(),
+            model_version: "".to_string(),
             id: String::new(),
             parameters: HashMap::new(),
             inputs: vec![

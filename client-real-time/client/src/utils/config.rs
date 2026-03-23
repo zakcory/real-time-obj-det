@@ -15,6 +15,8 @@ pub struct ModelConfig {
     pub precision: InferencePrecision,
     pub input_name: String,
     pub input_shape: Vec<i64>,
+    #[serde(default = "default_nms_in_triton")]
+    pub nms_in_triton: bool,
     #[serde(default)]
     pub output_name: Option<String>,
     #[serde(default)]
@@ -31,6 +33,10 @@ pub struct ModelOutputConfig {
     pub name: String,
     pub data_type: InferenceDataType,
     pub shape: Vec<i64>
+}
+
+fn default_nms_in_triton() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -245,6 +251,10 @@ impl AppConfig {
 }
 
 impl ModelConfig {
+    pub fn nms_in_triton(&self) -> bool {
+        self.nms_in_triton
+    }
+
     pub fn resolved_outputs(&self) -> Result<Vec<ModelOutputConfig>> {
         if !self.outputs.is_empty() {
             return Ok(self.outputs.clone());

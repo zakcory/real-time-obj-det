@@ -96,7 +96,7 @@ fn decode_int32(raw: &[u8], dtype: InferenceDataType) -> Result<Vec<i32>> {
 /// 2. detection_boxes [B, N, 4] in [y1, x1, y2, x2] on model input space
 /// 3. detection_scores [B, N]
 /// 4. detection_classes [B, N]
-pub fn postprocess(
+pub fn postprocess_nms_outputs(
     num_detections_raw: Vec<u8>,
     num_detections_dtype: InferenceDataType,
     boxes_raw: Vec<u8>,
@@ -163,6 +163,193 @@ pub fn postprocess(
     Ok(detections)
 }
 
+/// Perform NMS reduction of bboxes
+#[inline(never)]
+fn bbox_nms(detections: &mut Vec<ResultBBOX>, nms_threshold: f32) {
+    let len = detections.len();
+    if len <= 1 {
+        return;
+    }
+
+    detections.sort_unstable_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut write_idx = 0;
+
+    for i in 0..len {
+        let detection_i = unsafe { *detections.get_unchecked(i) };
+        let mut should_keep = true;
+
+        for j in 0..write_idx {
+            let kept = unsafe { detections.get_unchecked(j) };
+
+            if kept.class != detection_i.class {
+                continue;
+            }
+
+            let x1_max = detection_i.bbox[0].max(kept.bbox[0]);
+            let y1_max = detection_i.bbox[1].max(kept.bbox[1]);
+            let x2_min = detection_i.bbox[2].min(kept.bbox[2]);
+            let y2_min = detection_i.bbox[3].min(kept.bbox[3]);
+
+            if x1_max < x2_min && y1_max < y2_min {
+                let intersection = (x2_min - x1_max) * (y2_min - y1_max);
+                let area_i = (detection_i.bbox[2] - detection_i.bbox[0]) * (detection_i.bbox[3] - detection_i.bbox[1]);
+                let area_j = (kept.bbox[2] - kept.bbox[0]) * (kept.bbox[3] - kept.bbox[1]);
+                let union = area_i + area_j - intersection;
+
+                if intersection > nms_threshold * union {
+                    should_keep = false;
+                    break;
+                }
+            }
+        }
+
+        if should_keep {
+            unsafe {
+                *detections.get_unchecked_mut(write_idx) = detection_i;
+            }
+            write_idx += 1;
+        }
+    }
+
+    detections.truncate(write_idx);
+}
+
+fn postprocess_raw_output(
+    results: &[u8],
+    original_frame: &RawFrame,
+    target_size: u32,
+    target_features: u32,
+    precision: InferencePrecision,
+    pred_conf_threshold: f32,
+    nms_iou_threshold: f32,
+) -> Result<Vec<ResultBBOX>> {
+    let target_anchors = 8400_u32;
+    let target_classes = target_features - 4;
+
+    let expected_size = match precision {
+        InferencePrecision::FP16 => target_anchors * target_features * 2,
+        InferencePrecision::FP32 => target_anchors * target_features * 4,
+    } as usize;
+
+    if results.len() != expected_size {
+        anyhow::bail!(
+            "Got unexpected size of model output data ({}). Got {}, expected {}",
+            precision.to_string(),
+            results.len(),
+            expected_size
+        );
+    }
+
+    let letterbox = processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
+    let mut detections = Vec::with_capacity(256);
+
+    match precision {
+        InferencePrecision::FP16 => {
+            let u16_data = unsafe {
+                std::slice::from_raw_parts(results.as_ptr() as *const u16, results.len() / 2)
+            };
+
+            let stride1 = target_anchors;
+            let stride2 = target_anchors * 2;
+            let stride3 = target_anchors * 3;
+            let stride4 = target_anchors * 4;
+
+            for anchor_idx in 0..target_anchors {
+                unsafe {
+                    let x = processing::get_f16_to_f32_lut(*u16_data.get_unchecked(anchor_idx as usize));
+                    let y = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride1 + anchor_idx) as usize));
+                    let w = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride2 + anchor_idx) as usize));
+                    let h = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride3 + anchor_idx) as usize));
+
+                    let half_w = w * 0.5;
+                    let half_h = h * 0.5;
+                    let x1 = (x - half_w - letterbox.pad_x as f32) * letterbox.inv_scale;
+                    let y1 = (y - half_h - letterbox.pad_y as f32) * letterbox.inv_scale;
+                    let x2 = (x + half_w - letterbox.pad_x as f32) * letterbox.inv_scale;
+                    let y2 = (y + half_h - letterbox.pad_y as f32) * letterbox.inv_scale;
+
+                    let mut max_score: f32 = 0.0;
+                    let mut max_class: u32 = 0;
+                    let class_base = stride4 + anchor_idx;
+
+                    for class_idx in 0..target_classes {
+                        let prob_idx = (class_base + class_idx * stride1) as usize;
+                        let score = processing::get_f16_to_f32_lut(*u16_data.get_unchecked(prob_idx));
+                        if score > max_score {
+                            max_score = score;
+                            max_class = class_idx;
+                        }
+                    }
+
+                    if max_score >= pred_conf_threshold {
+                        detections.push(ResultBBOX {
+                            bbox: [x1, y1, x2, y2],
+                            class: max_class,
+                            score: max_score,
+                        });
+                    }
+                }
+            }
+        }
+        InferencePrecision::FP32 => {
+            let f32_data = unsafe {
+                std::slice::from_raw_parts(results.as_ptr() as *const f32, results.len() / 4)
+            };
+
+            let stride1 = target_anchors;
+            let stride2 = target_anchors * 2;
+            let stride3 = target_anchors * 3;
+            let stride4 = target_anchors * 4;
+
+            for anchor_idx in 0..target_anchors {
+                unsafe {
+                    let x = *f32_data.get_unchecked(anchor_idx as usize);
+                    let y = *f32_data.get_unchecked((stride1 + anchor_idx) as usize);
+                    let w = *f32_data.get_unchecked((stride2 + anchor_idx) as usize);
+                    let h = *f32_data.get_unchecked((stride3 + anchor_idx) as usize);
+
+                    let half_w = w * 0.5;
+                    let half_h = h * 0.5;
+                    let x1 = (x - half_w - letterbox.pad_x as f32) * letterbox.inv_scale;
+                    let y1 = (y - half_h - letterbox.pad_y as f32) * letterbox.inv_scale;
+                    let x2 = (x + half_w - letterbox.pad_x as f32) * letterbox.inv_scale;
+                    let y2 = (y + half_h - letterbox.pad_y as f32) * letterbox.inv_scale;
+
+                    let mut max_score: f32 = 0.0;
+                    let mut max_class: u32 = 0;
+                    let class_base = stride4 + anchor_idx;
+
+                    for class_idx in 0..target_classes {
+                        let prob_idx = (class_base + class_idx * stride1) as usize;
+                        let score = *f32_data.get_unchecked(prob_idx);
+                        if score > max_score {
+                            max_score = score;
+                            max_class = class_idx;
+                        }
+                    }
+
+                    if max_score >= pred_conf_threshold {
+                        detections.push(ResultBBOX {
+                            bbox: [x1, y1, x2, y2],
+                            class: max_class,
+                            score: max_score,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if detections.len() > 1 {
+        bbox_nms(&mut detections, nms_iou_threshold);
+    }
+
+    Ok(detections)
+}
+
 /// Performs operations on a given frame, including pre/post processing, inference on the given frame
 pub async fn process_frame(
     inference_model: &InferenceModel,
@@ -187,55 +374,101 @@ pub async fn process_frame(
         .context("Error preprocessing image for YOLO")?;
     let pre_proc_time = measure_start.elapsed();
 
-    // Inference
-    let measure_start = Instant::now();
-    let mut raw_outputs = inference_model
-        .infer_one_multi(pre_frame)
-        .await
-        .context("Error performing inference for YOLO")?;
-    let inference_time = measure_start.elapsed();
-
-    let num_detections_raw = raw_outputs
-        .remove("num_detections")
-        .context("Missing EfficientNMS output: num_detections")?;
-    let boxes_raw = raw_outputs
-        .remove("detection_boxes")
-        .context("Missing EfficientNMS output: detection_boxes")?;
-    let scores_raw = raw_outputs
-        .remove("detection_scores")
-        .context("Missing EfficientNMS output: detection_scores")?;
-    let classes_raw = raw_outputs
-        .remove("detection_classes")
-        .context("Missing EfficientNMS output: detection_classes")?;
-
-    // Post process
-    let measure_start = Instant::now();
     let post_conf_threshold = source_config.conf_threshold;
-    let _post_nms_iou_threshold = source_config.nms_iou_threshold;
-    let num_detections_dtype = inference_model.output_dtype("num_detections")?;
-    let boxes_dtype = inference_model.output_dtype("detection_boxes")?;
-    let scores_dtype = inference_model.output_dtype("detection_scores")?;
-    let classes_dtype = inference_model.output_dtype("detection_classes")?;
+    let post_nms_iou_threshold = source_config.nms_iou_threshold;
+    let nms_in_triton = inference_model.model_config().nms_in_triton();
 
-    let bboxes = tokio::task::spawn_blocking(move || {
-        postprocess(
-            num_detections_raw,
-            num_detections_dtype,
-            boxes_raw,
-            boxes_dtype,
-            scores_raw,
-            scores_dtype,
-            classes_raw,
-            classes_dtype,
-            &frame,
-            target_size,
-            post_conf_threshold,
-        )
-    })
-    .await
-    .context("Postprocess task failed")?
-    .context("Error postprocessing BBOXes for YOLO")?;
-    let post_proc_time = measure_start.elapsed();
+    let inference_time;
+    let post_proc_time;
+    let bboxes = if nms_in_triton {
+        let measure_start = Instant::now();
+        let mut raw_outputs = inference_model
+            .infer_one_multi(pre_frame)
+            .await
+            .context("Error performing inference for YOLO")?;
+        inference_time = measure_start.elapsed();
+
+        let num_detections_raw = raw_outputs
+            .remove("num_dets")
+            .context("Missing EfficientNMS output: num_detections")?;
+        let boxes_raw = raw_outputs
+            .remove("det_boxes")
+            .context("Missing EfficientNMS output: detection_boxes")?;
+        let scores_raw = raw_outputs
+            .remove("det_scores")
+            .context("Missing EfficientNMS output: detection_scores")?;
+        let classes_raw = raw_outputs
+            .remove("det_classes")
+            .context("Missing EfficientNMS output: detection_classes")?;
+
+        let measure_start = Instant::now();
+        let num_detections_dtype = inference_model.output_dtype("num_dets")?;
+        let boxes_dtype = inference_model.output_dtype("det_boxes")?;
+        let scores_dtype = inference_model.output_dtype("det_scores")?;
+        let classes_dtype = inference_model.output_dtype("det_classes")?;
+
+        let bboxes = tokio::task::spawn_blocking(move || {
+            postprocess_nms_outputs(
+                num_detections_raw,
+                num_detections_dtype,
+                boxes_raw,
+                boxes_dtype,
+                scores_raw,
+                scores_dtype,
+                classes_raw,
+                classes_dtype,
+                &frame,
+                target_size,
+                post_conf_threshold,
+            )
+        })
+        .await
+        .context("Postprocess task failed")?
+        .context("Error postprocessing BBOXes for YOLO")?;
+        post_proc_time = measure_start.elapsed();
+        bboxes
+    } else {
+        let measure_start = Instant::now();
+        let raw_results = inference_model
+            .infer(vec![pre_frame])
+            .await
+            .context("Error performing inference for YOLO")?;
+        inference_time = measure_start.elapsed();
+
+        let raw_results = match raw_results.into_iter().next() {
+            Some(res) => res,
+            None => anyhow::bail!("No inference results returned for YOLO"),
+        };
+
+        let outputs = inference_model
+            .model_config()
+            .resolved_outputs()
+            .context("Invalid model output configuration for YOLO")?;
+        let target_features = outputs
+            .first()
+            .and_then(|o| o.shape.first())
+            .copied()
+            .ok_or(anyhow::anyhow!("Invalid output shape for raw YOLO model"))?
+            as u32;
+
+        let measure_start = Instant::now();
+        let bboxes = tokio::task::spawn_blocking(move || {
+            postprocess_raw_output(
+                &raw_results,
+                &frame,
+                target_size,
+                target_features,
+                precision,
+                post_conf_threshold,
+                post_nms_iou_threshold,
+            )
+        })
+        .await
+        .context("Postprocess task failed")?
+        .context("Error postprocessing raw YOLO output")?;
+        post_proc_time = measure_start.elapsed();
+        bboxes
+    };
 
     // Statistics
     let mut stats = FrameProcessStats::default();
