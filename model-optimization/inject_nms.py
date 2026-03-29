@@ -12,11 +12,12 @@ Assumption:
 - scores = [:, :, 4:4+C]    -> [B, N, C]
 
 Flags:
-- --boxes-are-xywh: convert xywh(center) to xyxy before NMS (common for YOLO exports)
+- --boxes-are-xywh: convert xywh(center) to corner boxes before NMS (common for YOLO exports)
 - --apply-sigmoid: apply Sigmoid to class scores before NMS (use if scores are logits)
+- --box-order: choose whether the plugin sees corner boxes as xyxy or yxyx
 
 Usage example:
-  python inject_efficient_nms.py --model-in model.onnx --model-out model_with_nms.onnx --boxes-are-xywh
+  python inject_efficient_nms.py --model-in model.onnx --model-out model_with_nms.onnx --boxes-are-xywh --box-order yxyx
 """
 
 import argparse
@@ -37,24 +38,77 @@ def inspect_model(model_path: str) -> None:
         print(" ", o.name)
 
 
-def _xywh_to_xyxy(graph: gs.Graph, boxes_xywh: gs.Tensor, name_prefix: str = "boxes") -> gs.Tensor:
+def _make_slice(
+    graph: gs.Graph,
+    data: gs.Tensor,
+    output_name: str,
+    starts: list[int],
+    ends: list[int],
+    axes: list[int],
+    *,
+    steps: Optional[list[int]] = None,
+    dtype=np.float32,
+) -> gs.Tensor:
     """
-    Convert [B, N, 4] boxes from xywh(center) -> xyxy.
+    Build a Slice node using tensor inputs instead of legacy attributes.
+
+    TensorRT is generally happier with the modern ONNX Slice form:
+    data, starts, ends, axes, steps
+    """
+    output = gs.Variable(output_name, dtype=dtype)
+    slice_inputs = [
+        data,
+        gs.Constant(f"{output_name}_starts", values=np.asarray(starts, dtype=np.int64)),
+        gs.Constant(f"{output_name}_ends", values=np.asarray(ends, dtype=np.int64)),
+        gs.Constant(f"{output_name}_axes", values=np.asarray(axes, dtype=np.int64)),
+    ]
+
+    if steps is not None:
+        slice_inputs.append(
+            gs.Constant(f"{output_name}_steps", values=np.asarray(steps, dtype=np.int64))
+        )
+
+    graph.nodes.append(gs.Node("Slice", inputs=slice_inputs, outputs=[output]))
+    return output
+
+
+def _reorder_boxes(graph: gs.Graph, boxes: gs.Tensor, box_order: str, name_prefix: str = "boxes") -> gs.Tensor:
+    """
+    Reorder [B, N, 4] corner boxes between xyxy and yxyx layouts.
+    """
+    if box_order == "xyxy":
+        return boxes
+    if box_order != "yxyx":
+        raise ValueError(f"Unsupported box_order: {box_order}")
+
+    # Use distinct tensor names here so GraphSurgeon does not see them as the
+    # same tensors produced earlier by the xywh->corner conversion path.
+    x1 = _make_slice(graph, boxes, f"{name_prefix}_reorder_x1", [0], [1], [2])
+    y1 = _make_slice(graph, boxes, f"{name_prefix}_reorder_y1", [1], [2], [2])
+    x2 = _make_slice(graph, boxes, f"{name_prefix}_reorder_x2", [2], [3], [2])
+    y2 = _make_slice(graph, boxes, f"{name_prefix}_reorder_y2", [3], [4], [2])
+
+    reordered = gs.Variable(f"{name_prefix}_{box_order}", dtype=np.float32)
+    graph.nodes.append(
+        gs.Node("Concat", inputs=[y1, x1, y2, x2], outputs=[reordered], attrs={"axis": 2})
+    )
+    return reordered
+
+
+def _xywh_to_corners(
+    graph: gs.Graph,
+    boxes_xywh: gs.Tensor,
+    box_order: str,
+    name_prefix: str = "boxes",
+) -> gs.Tensor:
+    """
+    Convert [B, N, 4] boxes from xywh(center) -> corner boxes.
     """
     # Slices along last dim
-    x = gs.Variable(f"{name_prefix}_x", dtype=np.float32)
-    y = gs.Variable(f"{name_prefix}_y", dtype=np.float32)
-    w = gs.Variable(f"{name_prefix}_w", dtype=np.float32)
-    h = gs.Variable(f"{name_prefix}_h", dtype=np.float32)
-
-    graph.nodes.append(gs.Node("Slice", inputs=[boxes_xywh], outputs=[x],
-                               attrs={"starts": [0], "ends": [1], "axes": [2]}))
-    graph.nodes.append(gs.Node("Slice", inputs=[boxes_xywh], outputs=[y],
-                               attrs={"starts": [1], "ends": [2], "axes": [2]}))
-    graph.nodes.append(gs.Node("Slice", inputs=[boxes_xywh], outputs=[w],
-                               attrs={"starts": [2], "ends": [3], "axes": [2]}))
-    graph.nodes.append(gs.Node("Slice", inputs=[boxes_xywh], outputs=[h],
-                               attrs={"starts": [3], "ends": [4], "axes": [2]}))
+    x = _make_slice(graph, boxes_xywh, f"{name_prefix}_x", [0], [1], [2])
+    y = _make_slice(graph, boxes_xywh, f"{name_prefix}_y", [1], [2], [2])
+    w = _make_slice(graph, boxes_xywh, f"{name_prefix}_w", [2], [3], [2])
+    h = _make_slice(graph, boxes_xywh, f"{name_prefix}_h", [3], [4], [2])
 
     half = gs.Constant(f"{name_prefix}_half", values=np.array([0.5], dtype=np.float32))
 
@@ -75,7 +129,7 @@ def _xywh_to_xyxy(graph: gs.Graph, boxes_xywh: gs.Tensor, name_prefix: str = "bo
 
     boxes_xyxy = gs.Variable(f"{name_prefix}_xyxy", dtype=np.float32)
     graph.nodes.append(gs.Node("Concat", inputs=[x1, y1, x2, y2], outputs=[boxes_xyxy], attrs={"axis": 2}))
-    return boxes_xyxy
+    return _reorder_boxes(graph, boxes_xyxy, box_order, name_prefix)
 
 
 def inject_efficient_nms(
@@ -88,6 +142,7 @@ def inject_efficient_nms(
     iou_threshold: float,
     apply_sigmoid: bool,
     boxes_are_xywh: bool,
+    box_order: str,
     class_agnostic: bool,
     keep_old_outputs: bool,
 ) -> None:
@@ -114,13 +169,8 @@ def inject_efficient_nms(
     graph.nodes.append(gs.Node("Transpose", inputs=[raw_out], outputs=[out_t], attrs={"perm": [0, 2, 1]}))
 
     # Slice boxes and scores from last dim
-    boxes_raw = gs.Variable("boxes_raw", dtype=np.float32)
-    graph.nodes.append(gs.Node("Slice", inputs=[out_t], outputs=[boxes_raw],
-                               attrs={"starts": [0], "ends": [4], "axes": [2]}))
-
-    scores_raw = gs.Variable("scores_raw", dtype=np.float32)
-    graph.nodes.append(gs.Node("Slice", inputs=[out_t], outputs=[scores_raw],
-                               attrs={"starts": [4], "ends": [4 + num_classes], "axes": [2]}))
+    boxes_raw = _make_slice(graph, out_t, "boxes_raw", [0], [4], [2])
+    scores_raw = _make_slice(graph, out_t, "scores_raw", [4], [4 + num_classes], [2])
 
     # Optional sigmoid for scores
     if apply_sigmoid:
@@ -131,11 +181,11 @@ def inject_efficient_nms(
         scores = scores_raw
         score_activation_attr = 0  # don't ask plugin to apply activation
 
-    # Optional xywh(center) -> xyxy conversion
+    # Optional xywh(center) -> corner conversion
     if boxes_are_xywh:
-        boxes = _xywh_to_xyxy(graph, boxes_raw, "boxes")
+        boxes = _xywh_to_corners(graph, boxes_raw, box_order, "boxes")
     else:
-        boxes = boxes_raw
+        boxes = _reorder_boxes(graph, boxes_raw, box_order, "boxes")
 
     # EfficientNMS outputs
     B = "B"
@@ -153,7 +203,7 @@ def inject_efficient_nms(
         outputs=[num_dets, det_boxes, det_scores, det_classes],
         attrs={
             "background_class": -1,
-            "box_coding": 0,  # corner (xyxy)
+            "box_coding": 0,  # corner boxes
             "iou_threshold": float(iou_threshold),
             "score_threshold": float(score_threshold),
             "max_output_boxes": int(max_output_boxes),
@@ -182,14 +232,20 @@ def main() -> None:
     parser.add_argument("--output-name", default=None,
                         help="Name of the raw detection output tensor. Default: first model output.")
     parser.add_argument("--num-classes", type=int, default=80, help="Number of classes (default: 80)")
-    parser.add_argument("--max-output-boxes", type=int, default=100, help="Max detections per image (default: 100)")
-    parser.add_argument("--score-threshold", type=float, default=0.25, help="Score threshold (default: 0.25)")
-    parser.add_argument("--iou-threshold", type=float, default=0.45, help="IoU threshold (default: 0.45)")
+    parser.add_argument("--max-output-boxes", type=int, default=300, help="Max detections per image (default: 100)")
+    parser.add_argument("--score-threshold", type=float, default=0.01, help="Score threshold (default: 0.25)")
+    parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold (default: 0.45)")
 
     parser.add_argument("--apply-sigmoid", action="store_true",
                         help="Apply sigmoid to class scores before NMS (use if outputs are logits).")
     parser.add_argument("--boxes-are-xywh", action="store_true",
-                        help="Convert boxes from xywh(center) to xyxy before NMS.")
+                        help="Convert boxes from xywh(center) to corner boxes before NMS.")
+    parser.add_argument(
+        "--box-order",
+        choices=["xyxy", "yxyx"],
+        default="yxyx",
+        help="Corner-box order to feed into EfficientNMS and expose on outputs (default: yxyx).",
+    )
     parser.add_argument("--class-agnostic", action="store_true", help="Class-agnostic NMS (default: off).")
 
     parser.add_argument("--keep-old-outputs", action="store_true",
@@ -213,6 +269,7 @@ def main() -> None:
         iou_threshold=args.iou_threshold,
         apply_sigmoid=args.apply_sigmoid,
         boxes_are_xywh=args.boxes_are_xywh,
+        box_order=args.box_order,
         class_agnostic=args.class_agnostic,
         keep_old_outputs=args.keep_old_outputs,
     )
