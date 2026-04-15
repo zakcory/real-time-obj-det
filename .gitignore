@@ -87,3 +87,5 @@ sources/
 *.so
 
 plots/*
+source_codes/
+.codex
