@@ -72,29 +72,6 @@ def _make_slice(
     return output
 
 
-def _reorder_boxes(graph: gs.Graph, boxes: gs.Tensor, box_order: str, name_prefix: str = "boxes") -> gs.Tensor:
-    """
-    Reorder [B, N, 4] corner boxes between xyxy and yxyx layouts.
-    """
-    if box_order == "xyxy":
-        return boxes
-    if box_order != "yxyx":
-        raise ValueError(f"Unsupported box_order: {box_order}")
-
-    # Use distinct tensor names here so GraphSurgeon does not see them as the
-    # same tensors produced earlier by the xywh->corner conversion path.
-    x1 = _make_slice(graph, boxes, f"{name_prefix}_reorder_x1", [0], [1], [2])
-    y1 = _make_slice(graph, boxes, f"{name_prefix}_reorder_y1", [1], [2], [2])
-    x2 = _make_slice(graph, boxes, f"{name_prefix}_reorder_x2", [2], [3], [2])
-    y2 = _make_slice(graph, boxes, f"{name_prefix}_reorder_y2", [3], [4], [2])
-
-    reordered = gs.Variable(f"{name_prefix}_{box_order}", dtype=np.float32)
-    graph.nodes.append(
-        gs.Node("Concat", inputs=[y1, x1, y2, x2], outputs=[reordered], attrs={"axis": 2})
-    )
-    return reordered
-
-
 def _xywh_to_corners(
     graph: gs.Graph,
     boxes_xywh: gs.Tensor,
@@ -127,9 +104,10 @@ def _xywh_to_corners(
     graph.nodes.append(gs.Node("Add", inputs=[x, w_half], outputs=[x2]))
     graph.nodes.append(gs.Node("Add", inputs=[y, h_half], outputs=[y2]))
 
-    boxes_xyxy = gs.Variable(f"{name_prefix}_xyxy", dtype=np.float32)
-    graph.nodes.append(gs.Node("Concat", inputs=[x1, y1, x2, y2], outputs=[boxes_xyxy], attrs={"axis": 2}))
-    return _reorder_boxes(graph, boxes_xyxy, box_order, name_prefix)
+    boxes_out = gs.Variable(f"{name_prefix}_{box_order}", dtype=np.float32)
+    concat_inputs = [x1, y1, x2, y2] if box_order == "xyxy" else [y1, x1, y2, x2]
+    graph.nodes.append(gs.Node("Concat", inputs=concat_inputs, outputs=[boxes_out], attrs={"axis": 2}))
+    return boxes_out
 
 
 def inject_efficient_nms(
@@ -143,8 +121,6 @@ def inject_efficient_nms(
     apply_sigmoid: bool,
     boxes_are_xywh: bool,
     box_order: str,
-    class_agnostic: bool,
-    keep_old_outputs: bool,
 ) -> None:
     model = onnx.load(model_in)
     graph = gs.import_onnx(model)
@@ -184,8 +160,6 @@ def inject_efficient_nms(
     # Optional xywh(center) -> corner conversion
     if boxes_are_xywh:
         boxes = _xywh_to_corners(graph, boxes_raw, box_order, "boxes")
-    else:
-        boxes = _reorder_boxes(graph, boxes_raw, box_order, "boxes")
 
     # EfficientNMS outputs
     B = "B"
@@ -208,18 +182,40 @@ def inject_efficient_nms(
             "score_threshold": float(score_threshold),
             "max_output_boxes": int(max_output_boxes),
             "score_activation": int(score_activation_attr),
-            "class_agnostic": int(1 if class_agnostic else 0),
+            "class_agnostic": int(0),
         },
     )
     graph.nodes.append(nms_node)
 
-    if keep_old_outputs:
-        # Keep existing outputs and append new ones
-        # (useful for debugging, but Triton configs may need updating)
-        graph.outputs = list(graph.outputs) + [num_dets, det_boxes, det_scores, det_classes]
-    else:
-        # Replace outputs with NMS outputs
-        graph.outputs = [num_dets, det_boxes, det_scores, det_classes]
+    num_dets_f = gs.Variable("num_dets_f32", dtype=np.float32)
+    det_classes_f = gs.Variable("det_classes_f32", dtype=np.float32)
+    graph.nodes.append(gs.Node("Cast", inputs=[num_dets], outputs=[num_dets_f], attrs={"to": onnx.TensorProto.FLOAT}))
+    graph.nodes.append(gs.Node("Cast", inputs=[det_classes], outputs=[det_classes_f], attrs={"to": onnx.TensorProto.FLOAT}))
+
+    num_dets_flat = gs.Variable("num_dets_flat", dtype=np.float32)
+    det_boxes_flat = gs.Variable("det_boxes_flat", dtype=np.float32)
+    det_scores_flat = gs.Variable("det_scores_flat", dtype=np.float32)
+    det_classes_flat = gs.Variable("det_classes_flat", dtype=np.float32)
+    shape_b_flat = gs.Constant("shape_b_flat", values=np.asarray([0, -1], dtype=np.int64))
+
+    graph.nodes.append(gs.Node("Reshape", inputs=[num_dets_f, shape_b_flat], outputs=[num_dets_flat]))
+    graph.nodes.append(gs.Node("Reshape", inputs=[det_boxes, shape_b_flat], outputs=[det_boxes_flat]))
+    graph.nodes.append(gs.Node("Reshape", inputs=[det_scores, shape_b_flat], outputs=[det_scores_flat]))
+    graph.nodes.append(gs.Node("Reshape", inputs=[det_classes_f, shape_b_flat], outputs=[det_classes_flat]))
+
+    packed_features = 1 + (6 * K)
+    det_packed = gs.Variable("det_packed", dtype=np.float32, shape=[B, packed_features])
+    graph.nodes.append(
+        gs.Node(
+            "Concat",
+            inputs=[num_dets_flat, det_boxes_flat, det_scores_flat, det_classes_flat],
+            outputs=[det_packed],
+            attrs={"axis": 1},
+        )
+    )
+
+    # Replace outputs with NMS outputs
+    graph.outputs = det_packed
 
     graph.cleanup().toposort()
     onnx.save(gs.export_onnx(graph), model_out)
