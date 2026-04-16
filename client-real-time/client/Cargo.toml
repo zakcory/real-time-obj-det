@@ -9,6 +9,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.141"
 image = "0.25.6"
 triton-client = "0.2.0"
+shared_memory = "0.12.4"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter", "time"] }
 once_cell = "1.21.3"

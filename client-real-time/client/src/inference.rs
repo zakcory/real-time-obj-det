@@ -15,9 +15,9 @@ use tokio::sync::OnceCell;
 use anyhow::{self, Result, Context};
 
 // Custom modules
+use crate::shm::{shm_params, ShmRequest};
 use crate::utils::config::{
     AppConfig,
-    InferenceDataType,
     InferenceModelType,
     ModelConfig,
     ModelOutputConfig,
@@ -178,7 +178,7 @@ impl InferenceModel {
         let outputs_json: Vec<_> = outputs.iter().map(|output| {
             json!({
                 "name": output.name,
-                "data_type": output.data_type.to_string(),
+                "data_type": output.data_type.to_triton_data_type(),
                 "dims": output.shape
             })
         }).collect();
@@ -190,7 +190,7 @@ impl InferenceModel {
             "input": [
                 {
                     "name": &self.model_config().input_name,
-                    "data_type": format!("TYPE_{}", &self.model_config().precision.to_string()),
+                    "data_type": self.model_config().precision.to_triton_data_type(),
                     "dims": &self.model_config().input_shape
                 }
             ],
@@ -237,7 +237,7 @@ impl InferenceModel {
                     "inputs":  {
                         &self.model_config().input_name: {
                             "dims": &self.model_config().input_shape,
-                            "data_type": format!("TYPE_{}", &self.model_config().precision.to_string()),
+                            "data_type": self.model_config().precision.to_triton_data_type(),
                             "random_data": true
                         }
                     }
@@ -297,18 +297,49 @@ impl InferenceModel {
             for input in &raw_inputs {
                 concatenated.extend_from_slice(input);
             }
+
+            let mut shm_request = ShmRequest::new(
+                &self.client,
+                concatenated.len(),
+                num_inputs * output_size_per_sample,
+            )
+            .await
+            .context("Error creating Shared Memory regions for inference")?;
+            shm_request.input.write_all(&concatenated)?;
             
             let mut inference_request = self.base_request.clone();
             inference_request.inputs[0].shape.insert(0, num_inputs as i64);
-            inference_request.raw_input_contents = vec![concatenated];
+            inference_request.inputs[0].parameters =
+                shm_params(shm_request.input.name(), concatenated.len());
+            inference_request.raw_input_contents.clear();
+            inference_request.outputs[0].parameters =
+                shm_params(shm_request.output.name(), num_inputs * output_size_per_sample);
             
             // Network I/O - direct await
-            let inference_result = self.client.model_infer(inference_request)
+            let execution_result = self.client.model_infer(inference_request)
                 .await
-                .context("Error sending triton inference request")?;
-            
-            let output_blob = inference_result.raw_output_contents.into_iter().next()
-                .context("No output from inference")?;
+                .context("Error sending Triton SHM request")
+                .and_then(|inference_result| {
+                    if !inference_result.raw_output_contents.is_empty() {
+                        tracing::warn!(
+                            "Triton returned raw outputs for a shared memory request, reading output from the shared memory region"
+                        );
+                    }
+
+                    shm_request.output.read_vec(num_inputs * output_size_per_sample)
+                });
+
+            let ShmRequest { input, output } = shm_request;
+
+            if let Err(err) = output.unregister(&self.client).await {
+                tracing::warn!("Failed to unregister output shared memory region: {err:?}");
+            }
+
+            if let Err(err) = input.unregister(&self.client).await {
+                tracing::warn!("Failed to unregister input shared memory region: {err:?}");
+            }
+
+            let output_blob = execution_result?;
             
             // Process results directly
             // We do this inline because for a single batch the overhead of spawning a blocking task
@@ -337,22 +368,51 @@ impl InferenceModel {
                         concatenated.extend_from_slice(input);
                     }
                     
-                    let mut inference_request = self.base_request.clone();
-                    inference_request.inputs[0].shape.insert(0, batch_size as i64);
-                    inference_request.raw_input_contents = vec![concatenated];
-                    
                     let client = Arc::clone(&self.client);
+                    let base_request = self.base_request.clone();
                     let output_size = output_size_per_sample;
                     
-                    tokio::spawn(async move {
-                        // Network I/O - async
-                        let inference_result = client.model_infer(inference_request)
+                    async move {
+                        let mut shm_request = ShmRequest::new(
+                            &client,
+                            concatenated.len(),
+                            batch_size * output_size,
+                        )
+                        .await
+                        .context("Error creating Shared Memory regions for inference")?;
+                        shm_request.input.write_all(&concatenated)?;
+
+                        let mut inference_request = base_request;
+                        inference_request.inputs[0].shape.insert(0, batch_size as i64);
+                        inference_request.inputs[0].parameters =
+                            shm_params(shm_request.input.name(), concatenated.len());
+                        inference_request.raw_input_contents.clear();
+                        inference_request.outputs[0].parameters =
+                            shm_params(shm_request.output.name(), batch_size * output_size);
+
+                        let execution_result = client.model_infer(inference_request)
                             .await
-                            .context("Error sending triton inference request")?;
+                            .context("Error sending Triton SHM request")
+                            .and_then(|inference_result| {
+                                if !inference_result.raw_output_contents.is_empty() {
+                                    tracing::warn!(
+                                        "Triton returned raw outputs for a shared memory request, reading output from the shared memory region"
+                                    );
+                                }
+
+                                shm_request.output.read_vec(batch_size * output_size)
+                            });
                         
-                        // CPU work - blocking thread pool
-                        let output_blob = inference_result.raw_output_contents.into_iter().next()
-                            .context("No output from inference")?;
+                        // Unregister SHM from the Client
+                        let ShmRequest { input, output } = shm_request;
+                        if let Err(err) = output.unregister(&client).await {
+                            tracing::warn!("Failed to unregister output shared memory region: {err:?}");
+                        }
+                        if let Err(err) = input.unregister(&client).await {
+                            tracing::warn!("Failed to unregister input shared memory region: {err:?}");
+                        }
+
+                        let output_blob = execution_result?;
                         
                         let batch_results = tokio::task::spawn_blocking(move || {
                             // Unsafe pointer slicing for blazing speed
@@ -373,7 +433,7 @@ impl InferenceModel {
                         .context("Failed to split batch results")?;
                         
                         Ok::<(usize, Vec<Vec<u8>>), anyhow::Error>((start_idx, batch_results))
-                    })
+                    }
                 })
                 .collect();
             
@@ -383,7 +443,7 @@ impl InferenceModel {
                 .context("Error performing inference on all inputs")?;
             
             for result in results {
-                let (start_idx, batch) = result?;
+                let (start_idx, batch) = result;
                 for (i, output) in batch.into_iter().enumerate() {
                     all_results[start_idx + i] = output;
                 }
@@ -442,7 +502,7 @@ impl InferenceModel {
         self.model_config.resolved_outputs()
     }
 
-    pub fn output_dtype(&self, output_name: &str) -> Result<InferenceDataType> {
+    pub fn output_dtype(&self, output_name: &str) -> Result<crate::utils::config::InferencePrecision> {
         let outputs = self.resolved_outputs()?;
         outputs.into_iter()
             .find(|output| output.name == output_name)

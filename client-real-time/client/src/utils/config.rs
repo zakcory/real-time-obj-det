@@ -9,6 +9,8 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use serde_yaml;
 use serde::Deserialize;
 
+const PACKED_NMS_OUTPUT_NAME: &str = "det_packed";
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelConfig {
     pub name: String,
@@ -31,7 +33,7 @@ pub struct ModelConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelOutputConfig {
     pub name: String,
-    pub data_type: InferenceDataType,
+    pub data_type: InferencePrecision,
     pub shape: Vec<i64>
 }
 
@@ -84,7 +86,9 @@ pub struct InferenceConfig {
 /// Represents the inference model precision type
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Deserialize)]
 pub enum InferencePrecision {
+    #[serde(alias = "TYPE_FP32")]
     FP32,
+    #[serde(alias = "TYPE_FP16")]
     FP16
 }
 
@@ -95,30 +99,15 @@ impl InferencePrecision {
             InferencePrecision::FP16 => "FP16".to_string(),
         }
     }
-}
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Deserialize)]
-#[allow(non_camel_case_types)]
-pub enum InferenceDataType {
-    TYPE_FP32,
-    TYPE_FP16,
-    TYPE_INT32
-}
-
-impl InferenceDataType {
-    pub fn to_string(&self) -> String {
-        match self {
-            InferenceDataType::TYPE_FP32 => "TYPE_FP32".to_string(),
-            InferenceDataType::TYPE_FP16 => "TYPE_FP16".to_string(),
-            InferenceDataType::TYPE_INT32 => "TYPE_INT32".to_string(),
-        }
+    pub fn to_triton_data_type(&self) -> String {
+        format!("TYPE_{}", self.to_string())
     }
 
     pub fn byte_size(&self) -> usize {
         match self {
-            InferenceDataType::TYPE_FP32 => 4,
-            InferenceDataType::TYPE_FP16 => 2,
-            InferenceDataType::TYPE_INT32 => 4,
+            InferencePrecision::FP32 => 4,
+            InferencePrecision::FP16 => 2,
         }
     }
 }
@@ -198,6 +187,17 @@ impl AppConfig {
         }
         config.sources_config.sources = sources;
 
+        for (model_type, model_config) in config.inference_config().models.iter() {
+            model_config
+                .resolved_outputs()
+                .with_context(|| {
+                    format!(
+                        "Invalid output configuration for inference model {}",
+                        model_type.to_string()
+                    )
+                })?;
+        }
+
         Ok(config)
     }
 
@@ -256,29 +256,72 @@ impl ModelConfig {
     }
 
     pub fn resolved_outputs(&self) -> Result<Vec<ModelOutputConfig>> {
-        if !self.outputs.is_empty() {
-            return Ok(self.outputs.clone());
-        }
+        let outputs = if !self.outputs.is_empty() {
+            self.outputs.clone()
+        } else {
+            let output_name = self.output_name
+                .clone()
+                .context("Missing model output_name configuration")?;
+            let output_shape = self.output_shape
+                .clone()
+                .context("Missing model output_shape configuration")?;
 
-        let output_name = self.output_name
-            .clone()
-            .context("Missing model output_name configuration")?;
-        let output_shape = self.output_shape
-            .clone()
-            .context("Missing model output_shape configuration")?;
+            let data_type = if self.nms_in_triton {
+                InferencePrecision::FP32
+            } else {
+                self.precision
+            };
 
-        let data_type = match self.precision {
-            InferencePrecision::FP16 => InferenceDataType::TYPE_FP16,
-            InferencePrecision::FP32 => InferenceDataType::TYPE_FP32,
+            vec![
+                ModelOutputConfig {
+                    name: output_name,
+                    data_type,
+                    shape: output_shape,
+                }
+            ]
         };
 
-        Ok(vec![
-            ModelOutputConfig {
-                name: output_name,
-                data_type,
-                shape: output_shape,
+        if self.nms_in_triton {
+            if outputs.len() != 1 {
+                anyhow::bail!(
+                    "Packed NMS model contract expects exactly one output, got {}",
+                    outputs.len()
+                );
             }
-        ])
+
+            let packed_output = &outputs[0];
+            if packed_output.name != PACKED_NMS_OUTPUT_NAME {
+                anyhow::bail!(
+                    "Packed NMS model output must be named {}, got {}",
+                    PACKED_NMS_OUTPUT_NAME,
+                    packed_output.name
+                );
+            }
+
+            if packed_output.data_type != InferencePrecision::FP32 {
+                anyhow::bail!(
+                    "Packed NMS model output must use FP32, got {}",
+                    packed_output.data_type.to_string()
+                );
+            }
+
+            if packed_output.shape.len() != 1 {
+                anyhow::bail!(
+                    "Packed NMS model output must have 1D non-batch shape [1 + 6*K], got {:?}",
+                    packed_output.shape
+                );
+            }
+
+            let packed_len = packed_output.shape[0];
+            if packed_len <= 1 || ((packed_len - 1) % 6) != 0 {
+                anyhow::bail!(
+                    "Packed NMS model output shape must match [1 + 6*K], got {:?}",
+                    packed_output.shape
+                );
+            }
+        }
+
+        Ok(outputs)
     }
 }
 

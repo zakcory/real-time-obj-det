@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::inference::InferenceModel;
 use crate::processing::{self, RawFrame, ResultBBOX};
 use crate::statistics::FrameProcessStats;
-use crate::utils::config::{InferenceDataType, InferencePrecision, SourceConfig};
+use crate::utils::config::{InferencePrecision, ModelOutputConfig, SourceConfig};
 
 /// Performs pre-processing on raw RGB frame for YOLO models
 ///
@@ -36,131 +36,6 @@ pub fn preprocess_frame(frame: &RawFrame, precision: InferencePrecision, target_
         target_size,
         precision,
     )
-}
-
-fn decode_f32(raw: &[u8], dtype: InferenceDataType) -> Result<Vec<f32>> {
-    match dtype {
-        InferenceDataType::TYPE_FP32 => {
-            if raw.len() % 4 != 0 {
-                anyhow::bail!("Invalid FP32 output length: {}", raw.len());
-            }
-            Ok(raw
-                .chunks_exact(4)
-                .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                .collect())
-        }
-        InferenceDataType::TYPE_FP16 => {
-            if raw.len() % 2 != 0 {
-                anyhow::bail!("Invalid FP16 output length: {}", raw.len());
-            }
-            Ok(raw
-                .chunks_exact(2)
-                .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
-                .map(processing::get_f16_to_f32_lut)
-                .collect())
-        }
-        InferenceDataType::TYPE_INT32 => {
-            if raw.len() % 4 != 0 {
-                anyhow::bail!("Invalid INT32 output length: {}", raw.len());
-            }
-            Ok(raw
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32)
-                .collect())
-        }
-    }
-}
-
-fn decode_int32(raw: &[u8], dtype: InferenceDataType) -> Result<Vec<i32>> {
-    match dtype {
-        InferenceDataType::TYPE_INT32 => {
-            if raw.len() % 4 != 0 {
-                anyhow::bail!("Invalid INT32 output length: {}", raw.len());
-            }
-            Ok(raw
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                .collect())
-        }
-        InferenceDataType::TYPE_FP32 | InferenceDataType::TYPE_FP16 => Ok(decode_f32(raw, dtype)?
-            .into_iter()
-            .map(|v| v.round() as i32)
-            .collect()),
-    }
-}
-
-/// Performs post-processing on inference results for YOLO models with EfficientNMS output
-///
-/// Expected outputs:
-/// 1. num_detections [B, 1]
-/// 2. detection_boxes [B, N, 4] in [y1, x1, y2, x2] on model input space
-/// 3. detection_scores [B, N]
-/// 4. detection_classes [B, N]
-pub fn postprocess_nms_outputs(
-    num_detections_raw: Vec<u8>,
-    num_detections_dtype: InferenceDataType,
-    boxes_raw: Vec<u8>,
-    boxes_dtype: InferenceDataType,
-    scores_raw: Vec<u8>,
-    scores_dtype: InferenceDataType,
-    classes_raw: Vec<u8>,
-    classes_dtype: InferenceDataType,
-    original_frame: &RawFrame,
-    target_size: u32,
-    pred_conf_threshold: f32,
-) -> Result<Vec<ResultBBOX>> {
-    let counts = decode_int32(&num_detections_raw, num_detections_dtype)?;
-    let valid_detections = counts.first().copied().unwrap_or_default().max(0) as usize;
-
-    let boxes = decode_f32(&boxes_raw, boxes_dtype)?;
-    let scores = decode_f32(&scores_raw, scores_dtype)?;
-    let classes = decode_int32(&classes_raw, classes_dtype)?;
-
-    if boxes.len() % 4 != 0 {
-        anyhow::bail!("Boxes output length is not divisible by 4: {}", boxes.len());
-    }
-
-    let max_boxes = boxes.len() / 4;
-    if scores.len() < max_boxes || classes.len() < max_boxes {
-        anyhow::bail!(
-            "Mismatched NMS output sizes: boxes {}, scores {}, classes {}",
-            max_boxes,
-            scores.len(),
-            classes.len()
-        );
-    }
-
-    let detections_to_read = valid_detections.min(max_boxes);
-    let letterbox = processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
-    let frame_max_x = (original_frame.width.saturating_sub(1)) as f32;
-    let frame_max_y = (original_frame.height.saturating_sub(1)) as f32;
-
-    let mut detections = Vec::with_capacity(detections_to_read);
-    for i in 0..detections_to_read {
-        let score = scores[i];
-        if score < pred_conf_threshold {
-            continue;
-        }
-
-        let base = i * 4;
-        let y1_input = boxes[base];
-        let x1_input = boxes[base + 1];
-        let y2_input = boxes[base + 2];
-        let x2_input = boxes[base + 3];
-
-        let x1 = ((x1_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
-        let y1 = ((y1_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
-        let x2 = ((x2_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
-        let y2 = ((y2_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
-
-        detections.push(ResultBBOX {
-            bbox: [x1, y1, x2, y2],
-            class: classes[i].max(0) as u32,
-            score,
-        });
-    }
-
-    Ok(detections)
 }
 
 /// Perform NMS reduction of bboxes
@@ -217,28 +92,108 @@ fn bbox_nms(detections: &mut Vec<ResultBBOX>, nms_threshold: f32) {
     detections.truncate(write_idx);
 }
 
-fn postprocess_raw_output(
-    results: &[u8],
+fn postprocess_enms(
+    raw_results: &[u8],
+    outputs: &[ModelOutputConfig],
     original_frame: &RawFrame,
     target_size: u32,
-    target_features: u32,
+    precision: InferencePrecision,
+    pred_conf_threshold: f32,
+) -> Result<Vec<ResultBBOX>> {
+    if outputs.len() != 1 {
+            anyhow::bail!(
+                "Packed NMS mode expects single output, model has {} outputs",
+                outputs.len()
+            );
+    }
+    let packed_output = outputs.first().context("Missing packed NMS output config")?;
+    if packed_output.data_type != InferencePrecision::FP32 {
+        anyhow::bail!(
+            "Packed EfficientNMS expects FP32 output, got {}",
+            packed_output.data_type.to_string()
+        );
+    }
+    if raw_results.len() % 4 != 0 {
+        anyhow::bail!("Invalid packed FP32 output length: {}", raw_results.len());
+    }
+
+    let packed = unsafe {
+        std::slice::from_raw_parts(raw_results.as_ptr() as *const f32, raw_results.len() / 4)
+    };
+    if (packed.len() - 1) % 6 != 0 {
+        anyhow::bail!(
+            "Invalid packed EfficientNMS output length {} (expected 1 + 6*K)",
+            packed.len()
+        );
+    }
+
+    // Refer to the .md made in nexus-optimizing
+    let max_boxes = (packed.len() - 1) / 6;
+    let valid_detections = packed[0].round().max(0.0) as usize;
+    let boxes_start = 1;
+    let scores_start = 1 + (4 * max_boxes);
+    let classes_start = 1 + (5 * max_boxes);
+    let detections_to_read = valid_detections.min(max_boxes);
+
+    let letterbox = processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
+    let frame_max_x = (original_frame.width.saturating_sub(1)) as f32;
+    let frame_max_y = (original_frame.height.saturating_sub(1)) as f32;
+    let mut detections = Vec::with_capacity(detections_to_read);
+
+    for i in 0..detections_to_read {
+        let score = packed[scores_start + i];
+        if score < pred_conf_threshold {
+            continue;
+        }
+
+        let base = boxes_start + (i * 4);
+        let y1_input = packed[base];
+        let x1_input = packed[base + 1];
+        let y2_input = packed[base + 2];
+        let x2_input = packed[base + 3];
+
+        let x1 = ((x1_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
+        let y1 = ((y1_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
+        let x2 = ((x2_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
+        let y2 = ((y2_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
+
+        detections.push(ResultBBOX {
+            bbox: [x1, y1, x2, y2],
+            class: packed[classes_start + i].round().max(0.0) as u32,
+            score,
+        });
+    }
+
+    Ok(detections)
+}
+
+fn postprocess_raw_frame(
+    raw_results: &[u8],
+    outputs: &[ModelOutputConfig],
+    original_frame: &RawFrame,
+    target_size: u32,
     precision: InferencePrecision,
     pred_conf_threshold: f32,
     nms_iou_threshold: f32,
 ) -> Result<Vec<ResultBBOX>> {
+    let target_features = outputs
+        .first()
+        .and_then(|o| o.shape.first())
+        .copied()
+        .ok_or(anyhow::anyhow!("Invalid output shape for raw YOLO model"))?
+        as u32;
     let target_anchors = 8400_u32;
     let target_classes = target_features - 4;
-
     let expected_size = match precision {
         InferencePrecision::FP16 => target_anchors * target_features * 2,
         InferencePrecision::FP32 => target_anchors * target_features * 4,
     } as usize;
 
-    if results.len() != expected_size {
+    if raw_results.len() != expected_size {
         anyhow::bail!(
             "Got unexpected size of model output data ({}). Got {}, expected {}",
             precision.to_string(),
-            results.len(),
+            raw_results.len(),
             expected_size
         );
     }
@@ -249,7 +204,7 @@ fn postprocess_raw_output(
     match precision {
         InferencePrecision::FP16 => {
             let u16_data = unsafe {
-                std::slice::from_raw_parts(results.as_ptr() as *const u16, results.len() / 2)
+                std::slice::from_raw_parts(raw_results.as_ptr() as *const u16, raw_results.len() / 2)
             };
 
             let stride1 = target_anchors;
@@ -296,7 +251,7 @@ fn postprocess_raw_output(
         }
         InferencePrecision::FP32 => {
             let f32_data = unsafe {
-                std::slice::from_raw_parts(results.as_ptr() as *const f32, results.len() / 4)
+                std::slice::from_raw_parts(raw_results.as_ptr() as *const f32, raw_results.len() / 4)
             };
 
             let stride1 = target_anchors;
@@ -377,98 +332,52 @@ pub async fn process_frame(
     let post_conf_threshold = source_config.conf_threshold;
     let post_nms_iou_threshold = source_config.nms_iou_threshold;
     let nms_in_triton = inference_model.model_config().nms_in_triton();
+    let outputs = inference_model
+        .model_config()
+        .resolved_outputs()
+        .context("Invalid model output configuration for YOLO")?;
 
     let inference_time;
     let post_proc_time;
-    let bboxes = if nms_in_triton {
-        let measure_start = Instant::now();
-        let mut raw_outputs = inference_model
-            .infer_one_multi(pre_frame)
-            .await
-            .context("Error performing inference for YOLO")?;
-        inference_time = measure_start.elapsed();
+    let measure_start = Instant::now();
+    let raw_results = inference_model
+        .infer(vec![pre_frame])
+        .await
+        .context("Error performing inference for YOLO")?;
+    inference_time = measure_start.elapsed();
 
-        let num_detections_raw = raw_outputs
-            .remove("num_dets")
-            .context("Missing EfficientNMS output: num_detections")?;
-        let boxes_raw = raw_outputs
-            .remove("det_boxes")
-            .context("Missing EfficientNMS output: detection_boxes")?;
-        let scores_raw = raw_outputs
-            .remove("det_scores")
-            .context("Missing EfficientNMS output: detection_scores")?;
-        let classes_raw = raw_outputs
-            .remove("det_classes")
-            .context("Missing EfficientNMS output: detection_classes")?;
+    let raw_results = match raw_results.into_iter().next() {
+        Some(res) => res,
+        None => anyhow::bail!("No inference results returned for YOLO"),
+    };
 
-        let measure_start = Instant::now();
-        let num_detections_dtype = inference_model.output_dtype("num_dets")?;
-        let boxes_dtype = inference_model.output_dtype("det_boxes")?;
-        let scores_dtype = inference_model.output_dtype("det_scores")?;
-        let classes_dtype = inference_model.output_dtype("det_classes")?;
-
-        let bboxes = tokio::task::spawn_blocking(move || {
-            postprocess_nms_outputs(
-                num_detections_raw,
-                num_detections_dtype,
-                boxes_raw,
-                boxes_dtype,
-                scores_raw,
-                scores_dtype,
-                classes_raw,
-                classes_dtype,
+    let measure_start = Instant::now();
+    let bboxes: Vec<ResultBBOX> = tokio::task::spawn_blocking(move || {
+        if nms_in_triton {
+            postprocess_enms(
+                &raw_results,
+                &outputs,
                 &frame,
                 target_size,
+                precision,
                 post_conf_threshold,
             )
-        })
-        .await
-        .context("Postprocess task failed")?
-        .context("Error postprocessing BBOXes for YOLO")?;
-        post_proc_time = measure_start.elapsed();
-        bboxes
-    } else {
-        let measure_start = Instant::now();
-        let raw_results = inference_model
-            .infer(vec![pre_frame])
-            .await
-            .context("Error performing inference for YOLO")?;
-        inference_time = measure_start.elapsed();
-
-        let raw_results = match raw_results.into_iter().next() {
-            Some(res) => res,
-            None => anyhow::bail!("No inference results returned for YOLO"),
-        };
-
-        let outputs = inference_model
-            .model_config()
-            .resolved_outputs()
-            .context("Invalid model output configuration for YOLO")?;
-        let target_features = outputs
-            .first()
-            .and_then(|o| o.shape.first())
-            .copied()
-            .ok_or(anyhow::anyhow!("Invalid output shape for raw YOLO model"))?
-            as u32;
-
-        let measure_start = Instant::now();
-        let bboxes = tokio::task::spawn_blocking(move || {
-            postprocess_raw_output(
+        } else {
+            postprocess_raw_frame(
                 &raw_results,
+                &outputs,
                 &frame,
                 target_size,
-                target_features,
                 precision,
                 post_conf_threshold,
                 post_nms_iou_threshold,
             )
-        })
-        .await
-        .context("Postprocess task failed")?
-        .context("Error postprocessing raw YOLO output")?;
-        post_proc_time = measure_start.elapsed();
-        bboxes
-    };
+        }
+    })
+    .await
+    .context("Postprocess task failed")?
+    .context("Error postprocessing YOLO output")?;
+    post_proc_time = measure_start.elapsed();
 
     // Statistics
     let mut stats = FrameProcessStats::default();
