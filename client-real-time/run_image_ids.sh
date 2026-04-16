@@ -3,19 +3,19 @@
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/client/secrets/config.yaml"
+CONFIG_FILE="${SCRIPT_DIR}/secrets/config.yaml"
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
   echo "Config file not found: ${CONFIG_FILE}"
   exit 1
 fi
 
-if [[ -x "${SCRIPT_DIR}/run_local" ]]; then
-  RUN_LOCAL_CMD="${SCRIPT_DIR}/run_local"
-elif [[ -x "${SCRIPT_DIR}/run_local.sh" ]]; then
-  RUN_LOCAL_CMD="${SCRIPT_DIR}/run_local.sh"
+if [[ -x "${SCRIPT_DIR}/run_image" ]]; then
+  RUN_IMAGE_CMD="${SCRIPT_DIR}/run_image"
+elif [[ -x "${SCRIPT_DIR}/run_image.sh" ]]; then
+  RUN_IMAGE_CMD="${SCRIPT_DIR}/run_image.sh"
 else
-  echo "Could not find an executable run_local script in ${SCRIPT_DIR}"
+  echo "Could not find an executable run_image script in ${SCRIPT_DIR}"
   exit 1
 fi
 
@@ -33,23 +33,23 @@ restore_config() {
 }
 trap restore_config EXIT
 
-for end_id in {1..15}; do
+for end_id in 1 2 3 4 5; do
   ids_csv="$(seq -s ', ' 1 "${end_id}")"
   ids_line="  ids: [${ids_csv}]"
 
   sed -E -i "0,/^[[:space:]]*ids:[[:space:]]*\\[[^]]*\\][[:space:]]*$/s//${ids_line}/" "${CONFIG_FILE}"
 
   echo "Running with ids: [${ids_csv}]"
-  timeout 60s "${RUN_LOCAL_CMD}"
+  timeout 60s "${RUN_IMAGE_CMD}"
   status=$?
 
   if [[ ${status} -eq 124 ]]; then
-    echo "run_local timed out. Stopping."
+    echo "run_image timed out. Stopping."
     continue
   fi
 
   if [[ ${status} -ne 0 && ${status} -ne 130 && ${status} -ne 143 ]]; then
-    echo "run_local exited with status ${status}. Stopping."
+    echo "run_image exited with status ${status}. Stopping."
     exit "${status}"
   fi
 done

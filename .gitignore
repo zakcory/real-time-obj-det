@@ -89,3 +89,4 @@ sources/
 plots/*
 source_codes/
 .codex
+Dockerfile*

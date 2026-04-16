@@ -1,13 +1,13 @@
 //! Responsible for holding all application configuration under one place
 //! for easy access and setting format for same variables
 
-use std::path::{Path};
-use std::collections::HashMap;
-use anyhow::{self, Result, Context};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, fmt};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use serde_yaml;
+use anyhow::{self, Context, Result};
 use serde::Deserialize;
+use serde_yaml;
+use std::collections::HashMap;
+use std::path::Path;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 const PACKED_NMS_OUTPUT_NAME: &str = "det_packed";
 
@@ -19,6 +19,8 @@ pub struct ModelConfig {
     pub input_shape: Vec<i64>,
     #[serde(default = "default_nms_in_triton")]
     pub nms_in_triton: bool,
+    #[serde(default = "default_use_shm")]
+    pub use_shm: bool,
     #[serde(default)]
     pub output_name: Option<String>,
     #[serde(default)]
@@ -27,17 +29,21 @@ pub struct ModelConfig {
     pub outputs: Vec<ModelOutputConfig>,
     pub batch_max_size: u32,
     pub batch_max_queue_delay: u32,
-    pub batch_preferred_sizes: Vec<u32>
+    pub batch_preferred_sizes: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelOutputConfig {
     pub name: String,
     pub data_type: InferencePrecision,
-    pub shape: Vec<i64>
+    pub shape: Vec<i64>,
 }
 
 fn default_nms_in_triton() -> bool {
+    true
+}
+
+fn default_use_shm() -> bool {
     true
 }
 
@@ -48,39 +54,41 @@ pub struct SourcesConfig {
     pub ids: Vec<String>,
     pub default: SourceConfig,
     #[serde(default)]
-    pub custom: HashMap<String, SourceConfigOptional>
+    pub custom: HashMap<String, SourceConfigOptional>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceConfig {
     pub inf_frame: u32,
     pub conf_threshold: f32,
-    pub nms_iou_threshold: f32
+    pub nms_iou_threshold: f32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceConfigOptional {
     pub inf_frame: Option<u32>,
     pub conf_threshold: Option<f32>,
-    pub nms_iou_threshold: Option<f32>
+    pub nms_iou_threshold: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TritonConfig {
-    pub url: String
+    pub url: String,
+    #[serde(default = "default_use_shm")]
+    pub use_shm: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ElasticConfig {
     pub url: String,
-    pub index_name: String
+    pub index_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct InferenceConfig {
     pub models: HashMap<InferenceModelType, ModelConfig>,
     pub task: InferenceTask,
-    pub instances: u32
+    pub instances: u32,
 }
 
 /// Represents the inference model precision type
@@ -89,7 +97,7 @@ pub enum InferencePrecision {
     #[serde(alias = "TYPE_FP32")]
     FP32,
     #[serde(alias = "TYPE_FP16")]
-    FP16
+    FP16,
 }
 
 impl InferencePrecision {
@@ -118,7 +126,7 @@ impl InferencePrecision {
 pub enum InferenceModelType {
     YOLO,
     DINO,
-    DINO_OBJECTS
+    DINO_OBJECTS,
 }
 
 impl InferenceModelType {
@@ -126,7 +134,7 @@ impl InferenceModelType {
         match self {
             InferenceModelType::YOLO => "YOLO".to_string(),
             InferenceModelType::DINO => "DINO".to_string(),
-            InferenceModelType::DINO_OBJECTS => "DINO_OBJECTS".to_string()
+            InferenceModelType::DINO_OBJECTS => "DINO_OBJECTS".to_string(),
         }
     }
 }
@@ -135,7 +143,7 @@ impl InferenceModelType {
 #[derive(Copy, Clone, Debug, Deserialize)]
 pub enum InferenceTask {
     ObjectDetection,
-    Embedding
+    Embedding,
 }
 
 /// Represents all the configuation variables used by the application
@@ -145,14 +153,14 @@ pub struct AppConfig {
     sources_config: SourcesConfig,
     elastic_config: ElasticConfig,
     triton_config: TritonConfig,
-    inference_config: InferenceConfig
+    inference_config: InferenceConfig,
 }
 
 impl AppConfig {
     /// Creates a new instance of the configuration object
     pub fn new() -> Result<Self> {
-        let mut config: AppConfig = AppConfig::load_config_file()
-            .context("Error loading configuation file")?;
+        let mut config: AppConfig =
+            AppConfig::load_config_file().context("Error loading configuation file")?;
 
         // Initiate app logging
         AppConfig::init_logging(config.local);
@@ -180,22 +188,17 @@ impl AppConfig {
                 .filter(|&x| x >= 0.00 && x <= 1.00)
                 .unwrap_or(source_config.nms_iou_threshold);
 
-            sources.insert(
-                source_id.clone(), 
-                source_config
-            );
+            sources.insert(source_id.clone(), source_config);
         }
         config.sources_config.sources = sources;
 
         for (model_type, model_config) in config.inference_config().models.iter() {
-            model_config
-                .resolved_outputs()
-                .with_context(|| {
-                    format!(
-                        "Invalid output configuration for inference model {}",
-                        model_type.to_string()
-                    )
-                })?;
+            model_config.resolved_outputs().with_context(|| {
+                format!(
+                    "Invalid output configuration for inference model {}",
+                    model_type.to_string()
+                )
+            })?;
         }
 
         Ok(config)
@@ -206,13 +209,13 @@ impl AppConfig {
         // Path relative to cwd
         let config_file = "secrets/config.yaml".to_string();
         let config_path = Path::new(&config_file);
-        
-        // Load configuration file
-        let contents = std::fs::read_to_string(config_path)
-            .context("Error locating configuration file")?;
 
-        let config_file: AppConfig = serde_yaml::from_str(&contents)
-            .context("Error parsing configuration file")?;
+        // Load configuration file
+        let contents =
+            std::fs::read_to_string(config_path).context("Error locating configuration file")?;
+
+        let config_file: AppConfig =
+            serde_yaml::from_str(&contents).context("Error parsing configuration file")?;
 
         Ok(config_file)
     }
@@ -228,7 +231,7 @@ impl AppConfig {
                 tracing_subscriber::fmt::layer()
                     .json()
                     .with_timer(fmt::time::UtcTime::rfc_3339())
-                    .with_writer(non_blocking)
+                    .with_writer(non_blocking),
             )
         } else {
             None
@@ -241,7 +244,7 @@ impl AppConfig {
                 tracing_subscriber::fmt::layer()
                     .json()
                     .with_timer(fmt::time::UtcTime::rfc_3339())
-                    .with_writer(std::io::stdout)
+                    .with_writer(std::io::stdout),
             )
             .with(file_layer)
             .init();
@@ -259,10 +262,12 @@ impl ModelConfig {
         let outputs = if !self.outputs.is_empty() {
             self.outputs.clone()
         } else {
-            let output_name = self.output_name
+            let output_name = self
+                .output_name
                 .clone()
                 .context("Missing model output_name configuration")?;
-            let output_shape = self.output_shape
+            let output_shape = self
+                .output_shape
                 .clone()
                 .context("Missing model output_shape configuration")?;
 
@@ -272,13 +277,11 @@ impl ModelConfig {
                 self.precision
             };
 
-            vec![
-                ModelOutputConfig {
-                    name: output_name,
-                    data_type,
-                    shape: output_shape,
-                }
-            ]
+            vec![ModelOutputConfig {
+                name: output_name,
+                data_type,
+                shape: output_shape,
+            }]
         };
 
         if self.nms_in_triton {

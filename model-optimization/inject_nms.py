@@ -215,7 +215,7 @@ def inject_efficient_nms(
     )
 
     # Replace outputs with NMS outputs
-    graph.outputs = det_packed
+    graph.outputs = [det_packed]
 
     graph.cleanup().toposort()
     onnx.save(gs.export_onnx(graph), model_out)
@@ -266,8 +266,6 @@ def main() -> None:
         apply_sigmoid=args.apply_sigmoid,
         boxes_are_xywh=args.boxes_are_xywh,
         box_order=args.box_order,
-        class_agnostic=args.class_agnostic,
-        keep_old_outputs=args.keep_old_outputs,
     )
 
     print("Done.")

@@ -16,7 +16,11 @@ use crate::utils::config::{InferencePrecision, ModelOutputConfig, SourceConfig};
 /// 2. Normalizes pixels from 0-255 to 0-1
 /// 3. Converting raw pixel values to required precision datatype
 /// 4. Outputs raw bytes ordered by color channels(Planar): \[RRRBBBGGG\]
-pub fn preprocess_frame(frame: &RawFrame, precision: InferencePrecision, target_size: u32) -> Result<Vec<u8>> {
+pub fn preprocess_frame(
+    frame: &RawFrame,
+    precision: InferencePrecision,
+    target_size: u32,
+) -> Result<Vec<u8>> {
     // Validate input
     let frame_target_size = (frame.height * frame.width * 3) as usize;
     if frame.data.len() != frame_target_size {
@@ -47,7 +51,9 @@ fn bbox_nms(detections: &mut Vec<ResultBBOX>, nms_threshold: f32) {
     }
 
     detections.sort_unstable_by(|a, b| {
-        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut write_idx = 0;
@@ -70,7 +76,8 @@ fn bbox_nms(detections: &mut Vec<ResultBBOX>, nms_threshold: f32) {
 
             if x1_max < x2_min && y1_max < y2_min {
                 let intersection = (x2_min - x1_max) * (y2_min - y1_max);
-                let area_i = (detection_i.bbox[2] - detection_i.bbox[0]) * (detection_i.bbox[3] - detection_i.bbox[1]);
+                let area_i = (detection_i.bbox[2] - detection_i.bbox[0])
+                    * (detection_i.bbox[3] - detection_i.bbox[1]);
                 let area_j = (kept.bbox[2] - kept.bbox[0]) * (kept.bbox[3] - kept.bbox[1]);
                 let union = area_i + area_j - intersection;
 
@@ -97,16 +104,17 @@ fn postprocess_enms(
     outputs: &[ModelOutputConfig],
     original_frame: &RawFrame,
     target_size: u32,
-    precision: InferencePrecision,
     pred_conf_threshold: f32,
 ) -> Result<Vec<ResultBBOX>> {
     if outputs.len() != 1 {
-            anyhow::bail!(
-                "Packed NMS mode expects single output, model has {} outputs",
-                outputs.len()
-            );
+        anyhow::bail!(
+            "Packed NMS mode expects single output, model has {} outputs",
+            outputs.len()
+        );
     }
-    let packed_output = outputs.first().context("Missing packed NMS output config")?;
+    let packed_output = outputs
+        .first()
+        .context("Missing packed NMS output config")?;
     if packed_output.data_type != InferencePrecision::FP32 {
         anyhow::bail!(
             "Packed EfficientNMS expects FP32 output, got {}",
@@ -135,7 +143,8 @@ fn postprocess_enms(
     let classes_start = 1 + (5 * max_boxes);
     let detections_to_read = valid_detections.min(max_boxes);
 
-    let letterbox = processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
+    let letterbox =
+        processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
     let frame_max_x = (original_frame.width.saturating_sub(1)) as f32;
     let frame_max_y = (original_frame.height.saturating_sub(1)) as f32;
     let mut detections = Vec::with_capacity(detections_to_read);
@@ -152,10 +161,14 @@ fn postprocess_enms(
         let y2_input = packed[base + 2];
         let x2_input = packed[base + 3];
 
-        let x1 = ((x1_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
-        let y1 = ((y1_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
-        let x2 = ((x2_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
-        let y2 = ((y2_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
+        let x1 =
+            ((x1_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
+        let y1 =
+            ((y1_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
+        let x2 =
+            ((x2_input - letterbox.pad_x as f32) * letterbox.inv_scale).clamp(0.0, frame_max_x);
+        let y2 =
+            ((y2_input - letterbox.pad_y as f32) * letterbox.inv_scale).clamp(0.0, frame_max_y);
 
         detections.push(ResultBBOX {
             bbox: [x1, y1, x2, y2],
@@ -198,13 +211,17 @@ fn postprocess_raw_frame(
         );
     }
 
-    let letterbox = processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
+    let letterbox =
+        processing::calculate_letterbox(original_frame.height, original_frame.width, target_size);
     let mut detections = Vec::with_capacity(256);
 
     match precision {
         InferencePrecision::FP16 => {
             let u16_data = unsafe {
-                std::slice::from_raw_parts(raw_results.as_ptr() as *const u16, raw_results.len() / 2)
+                std::slice::from_raw_parts(
+                    raw_results.as_ptr() as *const u16,
+                    raw_results.len() / 2,
+                )
             };
 
             let stride1 = target_anchors;
@@ -214,10 +231,18 @@ fn postprocess_raw_frame(
 
             for anchor_idx in 0..target_anchors {
                 unsafe {
-                    let x = processing::get_f16_to_f32_lut(*u16_data.get_unchecked(anchor_idx as usize));
-                    let y = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride1 + anchor_idx) as usize));
-                    let w = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride2 + anchor_idx) as usize));
-                    let h = processing::get_f16_to_f32_lut(*u16_data.get_unchecked((stride3 + anchor_idx) as usize));
+                    let x = processing::get_f16_to_f32_lut(
+                        *u16_data.get_unchecked(anchor_idx as usize),
+                    );
+                    let y = processing::get_f16_to_f32_lut(
+                        *u16_data.get_unchecked((stride1 + anchor_idx) as usize),
+                    );
+                    let w = processing::get_f16_to_f32_lut(
+                        *u16_data.get_unchecked((stride2 + anchor_idx) as usize),
+                    );
+                    let h = processing::get_f16_to_f32_lut(
+                        *u16_data.get_unchecked((stride3 + anchor_idx) as usize),
+                    );
 
                     let half_w = w * 0.5;
                     let half_h = h * 0.5;
@@ -232,7 +257,8 @@ fn postprocess_raw_frame(
 
                     for class_idx in 0..target_classes {
                         let prob_idx = (class_base + class_idx * stride1) as usize;
-                        let score = processing::get_f16_to_f32_lut(*u16_data.get_unchecked(prob_idx));
+                        let score =
+                            processing::get_f16_to_f32_lut(*u16_data.get_unchecked(prob_idx));
                         if score > max_score {
                             max_score = score;
                             max_class = class_idx;
@@ -251,7 +277,10 @@ fn postprocess_raw_frame(
         }
         InferencePrecision::FP32 => {
             let f32_data = unsafe {
-                std::slice::from_raw_parts(raw_results.as_ptr() as *const f32, raw_results.len() / 4)
+                std::slice::from_raw_parts(
+                    raw_results.as_ptr() as *const f32,
+                    raw_results.len() / 4,
+                )
             };
 
             let stride1 = target_anchors;
@@ -323,10 +352,11 @@ pub async fn process_frame(
     let measure_start = Instant::now();
     let frame_clone = Arc::clone(&frame);
     let precision = inference_model.model_config().precision;
-    let pre_frame = tokio::task::spawn_blocking(move || preprocess_frame(&frame_clone, precision, target_size))
-        .await
-        .context("Preprocess task failed")?
-        .context("Error preprocessing image for YOLO")?;
+    let pre_frame =
+        tokio::task::spawn_blocking(move || preprocess_frame(&frame_clone, precision, target_size))
+            .await
+            .context("Preprocess task failed")?
+            .context("Error preprocessing image for YOLO")?;
     let pre_proc_time = measure_start.elapsed();
 
     let post_conf_threshold = source_config.conf_threshold;
@@ -359,7 +389,6 @@ pub async fn process_frame(
                 &outputs,
                 &frame,
                 target_size,
-                precision,
                 post_conf_threshold,
             )
         } else {

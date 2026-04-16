@@ -1,41 +1,38 @@
+use anyhow::{self, Context, Result};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 ///! Responsible for performing inference with Nvidia Triton Server
-///! 
+///!
 ///! Performs operations using gRPC protocol for minimal latency between
 ///! our application and Triton Server.
 ///! Allows us to dynamically load models(multiple instances) depending on amount of video sources we have
-
 use triton_client::Client;
-use triton_client::inference::{ModelInferRequest, RepositoryModelLoadRequest, ModelRepositoryParameter, RepositoryModelUnloadRequest};
 use triton_client::inference::model_infer_request::{InferInputTensor, InferRequestedOutputTensor};
-use triton_client::inference::model_repository_parameter::{ParameterChoice};
-use std::collections::HashMap;
-use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
-use anyhow::{self, Result, Context};
+use triton_client::inference::model_repository_parameter::ParameterChoice;
+use triton_client::inference::{
+    ModelInferRequest, ModelRepositoryParameter, RepositoryModelLoadRequest,
+    RepositoryModelUnloadRequest,
+};
 
 // Custom modules
-use crate::shm::{shm_params, ShmRequest};
+use crate::shm::{ShmRequest, shm_params};
 use crate::utils::config::{
-    AppConfig,
-    InferenceModelType,
-    ModelConfig,
-    ModelOutputConfig,
-    TritonConfig,
+    AppConfig, InferenceModelType, ModelConfig, ModelOutputConfig, TritonConfig,
 };
 
 // Variables
-pub static INFERENCE_MODELS: OnceCell<HashMap<InferenceModelType, Arc<InferenceModel>>> = OnceCell::const_new();
+pub static INFERENCE_MODELS: OnceCell<HashMap<InferenceModelType, Arc<InferenceModel>>> =
+    OnceCell::const_new();
 
 /// Returns the inference model instance, if initiated
 pub fn get_inference_model(model_type: InferenceModelType) -> Result<&'static Arc<InferenceModel>> {
-    Ok(
-        INFERENCE_MODELS
-            .get()
-            .context("Infernece models are not initiated!")?
-            .get(&model_type)
-            .context("Infernece model is not initiated!")?
-    )
+    Ok(INFERENCE_MODELS
+        .get()
+        .context("Infernece models are not initiated!")?
+        .get(&model_type)
+        .context("Infernece model is not initiated!")?)
 }
 
 /// Initiates a single instance of a model for inference
@@ -48,21 +45,17 @@ pub async fn init_inference_models(app_config: &AppConfig) -> Result<()> {
     let mut models: HashMap<InferenceModelType, Arc<InferenceModel>> = HashMap::new();
     for (model_type, model_config) in app_config.inference_config().models.iter() {
         // Create single instance
-        let client_instance = InferenceModel::new(
-            app_config.triton_config().clone(),
-            model_config.clone(),
-        )
-            .await
-            .context("Error creating model client")?;
+        let client_instance =
+            InferenceModel::new(app_config.triton_config().clone(), model_config.clone())
+                .await
+                .context("Error creating model client")?;
 
-        models.insert(
-            model_type.clone(),
-            Arc::new(client_instance)
-        );
+        models.insert(model_type.clone(), Arc::new(client_instance));
     }
 
     // Set global variable
-    INFERENCE_MODELS.set(models)
+    INFERENCE_MODELS
+        .set(models)
         .map_err(|_| anyhow::anyhow!("Error setting model instances"))?;
 
     Ok(())
@@ -77,14 +70,23 @@ pub async fn start_models_instances(app_config: &AppConfig) -> Result<()> {
 
         // Clear previous model instances
         if let Ok(_) = client_instance.unload_model().await {
-            tracing::warn!("Unloaded previous model instances for type {}", model_type.to_string());
+            tracing::warn!(
+                "Unloaded previous model instances for type {}",
+                model_type.to_string()
+            );
         }
 
         // Initiate model instances
-        client_instance.load_model(instances).await
+        client_instance
+            .load_model(instances)
+            .await
             .context("Error loading model instances")?;
 
-        tracing::info!("Initiated {} model instances for type {}", instances, model_type.to_string());
+        tracing::info!(
+            "Initiated {} model instances for type {}",
+            instances,
+            model_type.to_string()
+        );
     }
 
     Ok(())
@@ -95,26 +97,24 @@ pub struct InferenceModel {
     client: Arc<Client>,
     triton_config: TritonConfig,
     model_config: ModelConfig,
-    base_request: ModelInferRequest
+    base_request: ModelInferRequest,
 }
 
 impl InferenceModel {
     /// Create new instance of inference model
-    /// 
+    ///
     /// Creates a new Triton Server client for inference
     /// Initiate all values for fast inference, including a pre-made request body for inference
     /// Reports statistics about GPU utilization
-    pub async fn new(
-        triton_config: TritonConfig,
-        model_config: ModelConfig
-    ) -> Result<Self> {
+    pub async fn new(triton_config: TritonConfig, model_config: ModelConfig) -> Result<Self> {
         //Create client instance
         let client = Client::new(&triton_config.url, None)
             .await
             .context("Error creating triton client instance")?;
 
         // Check if server is ready
-        let server_ready = client.server_ready()
+        let server_ready = client
+            .server_ready()
             .await
             .context("Error getting model ready status")?;
 
@@ -125,7 +125,8 @@ impl InferenceModel {
         // Create base inference request
         let mut batch_input_shape = Vec::with_capacity(&model_config.input_shape.len() + 1);
         batch_input_shape.extend(&model_config.input_shape);
-        let outputs = model_config.resolved_outputs()
+        let outputs = model_config
+            .resolved_outputs()
             .context("Error resolving model outputs")?;
 
         let base_request = ModelInferRequest {
@@ -133,55 +134,61 @@ impl InferenceModel {
             model_version: "".to_string(),
             id: String::new(),
             parameters: HashMap::new(),
-            inputs: vec![
-                InferInputTensor {
-                    name: model_config.input_name.to_string(),
-                    datatype: model_config.precision.to_string(),
-                    shape: batch_input_shape,
-                    parameters: HashMap::new(),
-                    contents: None
-                }
-            ],
-            outputs: outputs.into_iter().map(|output| InferRequestedOutputTensor {
-                name: output.name,
+            inputs: vec![InferInputTensor {
+                name: model_config.input_name.to_string(),
+                datatype: model_config.precision.to_string(),
+                shape: batch_input_shape,
                 parameters: HashMap::new(),
-            }).collect(),
-            raw_input_contents: Vec::new()
+                contents: None,
+            }],
+            outputs: outputs
+                .into_iter()
+                .map(|output| InferRequestedOutputTensor {
+                    name: output.name,
+                    parameters: HashMap::new(),
+                })
+                .collect(),
+            raw_input_contents: Vec::new(),
         };
 
-        Ok(Self { 
+        Ok(Self {
             client: Arc::new(client),
             triton_config,
             model_config,
-            base_request
+            base_request,
         })
     }
 
     /// Unloads running instances of a given model
     pub async fn unload_model(&self) -> Result<()> {
         // Unload previous instances of model we're about to load
-        self.client.repository_model_unload(RepositoryModelUnloadRequest { 
-            repository_name: "".to_string(), 
-            model_name: self.model_config().name.to_string(), 
-            parameters: HashMap::new()
-        })
+        self.client
+            .repository_model_unload(RepositoryModelUnloadRequest {
+                repository_name: "".to_string(),
+                model_name: self.model_config().name.to_string(),
+                parameters: HashMap::new(),
+            })
             .await
             .context("Error unloading previous triton model instances")?;
 
         Ok(())
     }
-    
+
     /// Loads given amount of instances of a given model
     pub async fn load_model(&self, instances: u32) -> Result<()> {
-        let outputs = self.resolved_outputs()
+        let outputs = self
+            .resolved_outputs()
             .context("Error resolving model outputs")?;
-        let outputs_json: Vec<_> = outputs.iter().map(|output| {
-            json!({
-                "name": output.name,
-                "data_type": output.data_type.to_triton_data_type(),
-                "dims": output.shape
+        let outputs_json: Vec<_> = outputs
+            .iter()
+            .map(|output| {
+                json!({
+                    "name": output.name,
+                    "data_type": output.data_type.to_triton_data_type(),
+                    "dims": output.shape
+                })
             })
-        }).collect();
+            .collect();
 
         let model_config = json!({
             "name": &self.model_config().name,
@@ -247,26 +254,118 @@ impl InferenceModel {
 
         // Define model config
         let mut parameters = HashMap::new();
-        parameters.insert("config".to_string(), ModelRepositoryParameter{ 
-            parameter_choice: Some(ParameterChoice::StringParam(model_config.to_string()))
-        });
+        parameters.insert(
+            "config".to_string(),
+            ModelRepositoryParameter {
+                parameter_choice: Some(ParameterChoice::StringParam(model_config.to_string())),
+            },
+        );
 
         // Load selected model
-        self.client.repository_model_load(RepositoryModelLoadRequest { 
-            repository_name: "".to_string(), 
-            model_name: self.model_config().name.to_string(), 
-            parameters
-        })
+        self.client
+            .repository_model_load(RepositoryModelLoadRequest {
+                repository_name: "".to_string(),
+                model_name: self.model_config().name.to_string(),
+                parameters,
+            })
             .await
             .context("Error loading triton model instances")?;
 
         Ok(())
     }
 
+    fn build_inference_request(&self, batch_size: usize) -> ModelInferRequest {
+        let mut inference_request = self.base_request.clone();
+        inference_request.inputs[0]
+            .shape
+            .insert(0, batch_size as i64);
+        inference_request
+    }
+
+    async fn infer_single_output_raw(
+        client: &Client,
+        mut inference_request: ModelInferRequest,
+        raw_input: Vec<u8>,
+        expected_output_size: usize,
+    ) -> Result<Vec<u8>> {
+        inference_request.inputs[0].parameters.clear();
+        for output in &mut inference_request.outputs {
+            output.parameters.clear();
+        }
+        inference_request.raw_input_contents = vec![raw_input];
+
+        let inference_result = client
+            .model_infer(inference_request)
+            .await
+            .context("Error sending Triton inference request")?;
+
+        if inference_result.raw_output_contents.len() != 1 {
+            anyhow::bail!(
+                "Unexpected number of inference outputs: got {}, expected 1",
+                inference_result.raw_output_contents.len()
+            );
+        }
+
+        let output_blob = inference_result
+            .raw_output_contents
+            .into_iter()
+            .next()
+            .context("Missing inference output blob")?;
+
+        if output_blob.len() != expected_output_size {
+            anyhow::bail!(
+                "Unexpected output size: got {}, expected {}",
+                output_blob.len(),
+                expected_output_size
+            );
+        }
+
+        Ok(output_blob)
+    }
+
+    async fn infer_single_output_shm(
+        client: &Client,
+        mut inference_request: ModelInferRequest,
+        raw_input: Vec<u8>,
+        expected_output_size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut shm_request = ShmRequest::new(client, raw_input.len(), expected_output_size)
+            .await
+            .context("Error creating Shared Memory regions for inference")?;
+        shm_request.input.write_all(&raw_input)?;
+
+        inference_request.inputs[0].parameters =
+            shm_params(shm_request.input.name(), raw_input.len());
+        inference_request.raw_input_contents.clear();
+        inference_request.outputs[0].parameters =
+            shm_params(shm_request.output.name(), expected_output_size);
+
+        let execution_result = match client
+            .model_infer(inference_request)
+            .await
+            .context("Error sending Triton SHM request")
+        {
+            Ok(_) => shm_request.output.read_vec(expected_output_size),
+            Err(err) => Err(err),
+        };
+        let ShmRequest { input, output } = shm_request;
+
+        if let Err(err) = output.unregister(client).await {
+            tracing::warn!("Failed to unregister output shared memory region: {err:?}");
+        }
+
+        if let Err(err) = input.unregister(client).await {
+            tracing::warn!("Failed to unregister input shared memory region: {err:?}");
+        }
+
+        execution_result
+    }
+
     /// Performs inference on many raw inputs, returning raw model results
     /// Automatically batches requests up to max_batch_size and processes batches concurrently
     pub async fn infer(&self, raw_inputs: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
-        let outputs = self.resolved_outputs()
+        let outputs = self
+            .resolved_outputs()
             .context("Error resolving model outputs")?;
         if outputs.len() != 1 {
             anyhow::bail!(
@@ -275,21 +374,26 @@ impl InferenceModel {
                 outputs.len()
             );
         }
-        let single_output = outputs.into_iter().next()
+        let single_output = outputs
+            .into_iter()
+            .next()
             .context("Missing output config")?;
 
         let max_batch_size = self.model_config.batch_max_size as usize;
         let num_inputs = raw_inputs.len();
+        let use_shm = self.triton_config.use_shm;
         // Calculate output size per sample once
-        let output_size_per_sample: usize = single_output.shape
+        let output_size_per_sample: usize = single_output
+            .shape
             .iter()
             .map(|&dim| dim as usize)
-            .product::<usize>() * single_output.data_type.byte_size();
-        
+            .product::<usize>()
+            * single_output.data_type.byte_size();
+
         // Pre-allocate result slots - direct placement, no sorting
         let mut all_results: Vec<Vec<u8>> = Vec::with_capacity(num_inputs);
         all_results.resize_with(num_inputs, Vec::new);
-        
+
         // Fast path: if inputs fit in one batch, execute directly without spawning tasks
         if num_inputs <= max_batch_size {
             let total_bytes: usize = raw_inputs.iter().map(|v| v.len()).sum();
@@ -298,49 +402,25 @@ impl InferenceModel {
                 concatenated.extend_from_slice(input);
             }
 
-            let mut shm_request = ShmRequest::new(
-                &self.client,
-                concatenated.len(),
-                num_inputs * output_size_per_sample,
-            )
-            .await
-            .context("Error creating Shared Memory regions for inference")?;
-            shm_request.input.write_all(&concatenated)?;
-            
-            let mut inference_request = self.base_request.clone();
-            inference_request.inputs[0].shape.insert(0, num_inputs as i64);
-            inference_request.inputs[0].parameters =
-                shm_params(shm_request.input.name(), concatenated.len());
-            inference_request.raw_input_contents.clear();
-            inference_request.outputs[0].parameters =
-                shm_params(shm_request.output.name(), num_inputs * output_size_per_sample);
-            
-            // Network I/O - direct await
-            let execution_result = self.client.model_infer(inference_request)
-                .await
-                .context("Error sending Triton SHM request")
-                .and_then(|inference_result| {
-                    if !inference_result.raw_output_contents.is_empty() {
-                        tracing::warn!(
-                            "Triton returned raw outputs for a shared memory request, reading output from the shared memory region"
-                        );
-                    }
+            let inference_request = self.build_inference_request(num_inputs);
+            let output_blob = if use_shm {
+                Self::infer_single_output_shm(
+                    &self.client,
+                    inference_request,
+                    concatenated,
+                    num_inputs * output_size_per_sample,
+                )
+                .await?
+            } else {
+                Self::infer_single_output_raw(
+                    &self.client,
+                    inference_request,
+                    concatenated,
+                    num_inputs * output_size_per_sample,
+                )
+                .await?
+            };
 
-                    shm_request.output.read_vec(num_inputs * output_size_per_sample)
-                });
-
-            let ShmRequest { input, output } = shm_request;
-
-            if let Err(err) = output.unregister(&self.client).await {
-                tracing::warn!("Failed to unregister output shared memory region: {err:?}");
-            }
-
-            if let Err(err) = input.unregister(&self.client).await {
-                tracing::warn!("Failed to unregister input shared memory region: {err:?}");
-            }
-
-            let output_blob = execution_result?;
-            
             // Process results directly
             // We do this inline because for a single batch the overhead of spawning a blocking task
             // might outweigh the benefit, and we want to minimize latency.
@@ -352,7 +432,7 @@ impl InferenceModel {
                     all_results[i] = slice.to_vec();
                 }
             }
-        } else {     
+        } else {
             // Process all batches concurrently (1 batch if num_inputs <= max_batch_size)
             let tasks: Vec<_> = raw_inputs
                 .chunks(max_batch_size)
@@ -360,88 +440,69 @@ impl InferenceModel {
                 .map(|(chunk_idx, chunk)| {
                     let batch_size = chunk.len();
                     let start_idx = chunk_idx * max_batch_size;
-                    
+
                     // Concatenate batch for Triton
                     let total_bytes: usize = chunk.iter().map(|v| v.len()).sum();
                     let mut concatenated = Vec::with_capacity(total_bytes);
                     for input in chunk {
                         concatenated.extend_from_slice(input);
                     }
-                    
+
                     let client = Arc::clone(&self.client);
-                    let base_request = self.base_request.clone();
+                    let mut inference_request = self.base_request.clone();
+                    inference_request.inputs[0]
+                        .shape
+                        .insert(0, batch_size as i64);
                     let output_size = output_size_per_sample;
-                    
+
                     async move {
-                        let mut shm_request = ShmRequest::new(
-                            &client,
-                            concatenated.len(),
-                            batch_size * output_size,
-                        )
-                        .await
-                        .context("Error creating Shared Memory regions for inference")?;
-                        shm_request.input.write_all(&concatenated)?;
+                        let output_blob = if use_shm {
+                            Self::infer_single_output_shm(
+                                &client,
+                                inference_request,
+                                concatenated,
+                                batch_size * output_size,
+                            )
+                            .await?
+                        } else {
+                            Self::infer_single_output_raw(
+                                &client,
+                                inference_request,
+                                concatenated,
+                                batch_size * output_size,
+                            )
+                            .await?
+                        };
 
-                        let mut inference_request = base_request;
-                        inference_request.inputs[0].shape.insert(0, batch_size as i64);
-                        inference_request.inputs[0].parameters =
-                            shm_params(shm_request.input.name(), concatenated.len());
-                        inference_request.raw_input_contents.clear();
-                        inference_request.outputs[0].parameters =
-                            shm_params(shm_request.output.name(), batch_size * output_size);
-
-                        let execution_result = client.model_infer(inference_request)
-                            .await
-                            .context("Error sending Triton SHM request")
-                            .and_then(|inference_result| {
-                                if !inference_result.raw_output_contents.is_empty() {
-                                    tracing::warn!(
-                                        "Triton returned raw outputs for a shared memory request, reading output from the shared memory region"
-                                    );
-                                }
-
-                                shm_request.output.read_vec(batch_size * output_size)
-                            });
-                        
-                        // Unregister SHM from the Client
-                        let ShmRequest { input, output } = shm_request;
-                        if let Err(err) = output.unregister(&client).await {
-                            tracing::warn!("Failed to unregister output shared memory region: {err:?}");
-                        }
-                        if let Err(err) = input.unregister(&client).await {
-                            tracing::warn!("Failed to unregister input shared memory region: {err:?}");
-                        }
-
-                        let output_blob = execution_result?;
-                        
                         let batch_results = tokio::task::spawn_blocking(move || {
                             // Unsafe pointer slicing for blazing speed
                             let ptr = output_blob.as_ptr();
                             let mut results = Vec::with_capacity(batch_size);
-                            
+
                             unsafe {
                                 for i in 0..batch_size {
                                     let offset = i * output_size;
-                                    let slice = std::slice::from_raw_parts(ptr.add(offset), output_size);
+                                    let slice =
+                                        std::slice::from_raw_parts(ptr.add(offset), output_size);
                                     results.push(slice.to_vec());
                                 }
                             }
-                            
+
                             results
                         })
                         .await
                         .context("Failed to split batch results")?;
-                        
+
                         Ok::<(usize, Vec<Vec<u8>>), anyhow::Error>((start_idx, batch_results))
                     }
                 })
                 .collect();
-            
+
             // Await all batches and place directly
             let results = futures::future::try_join_all(tasks)
                 .await
                 .context("Error performing inference on all inputs")?;
-            
+
             for result in results {
                 let (start_idx, batch) = result;
                 for (i, output) in batch.into_iter().enumerate() {
@@ -452,49 +513,6 @@ impl InferenceModel {
 
         Ok(all_results)
     }
-
-    /// Performs inference for a single input on multi-output models (e.g. EfficientNMS YOLO)
-    pub async fn infer_one_multi(&self, raw_input: Vec<u8>) -> Result<HashMap<String, Vec<u8>>> {
-        let outputs = self.resolved_outputs()
-            .context("Error resolving model outputs")?;
-
-        let mut inference_request = self.base_request.clone();
-        inference_request.inputs[0].shape.insert(0, 1);
-        inference_request.raw_input_contents = vec![raw_input];
-
-        let inference_result = self.client.model_infer(inference_request)
-            .await
-            .context("Error sending triton inference request")?;
-
-        if inference_result.raw_output_contents.len() != outputs.len() {
-            anyhow::bail!(
-                "Unexpected number of inference outputs: got {}, expected {}",
-                inference_result.raw_output_contents.len(),
-                outputs.len()
-            );
-        }
-
-        let mut mapped_outputs = HashMap::with_capacity(outputs.len());
-        for (output_cfg, output_blob) in outputs.into_iter().zip(inference_result.raw_output_contents.into_iter()) {
-            let expected_size_per_sample = output_cfg.shape
-                .iter()
-                .map(|&dim| dim as usize)
-                .product::<usize>() * output_cfg.data_type.byte_size();
-
-            if output_blob.len() != expected_size_per_sample {
-                anyhow::bail!(
-                    "Unexpected output size for {}: got {}, expected {}",
-                    output_cfg.name,
-                    output_blob.len(),
-                    expected_size_per_sample
-                );
-            }
-
-            mapped_outputs.insert(output_cfg.name, output_blob);
-        }
-
-        Ok(mapped_outputs)
-    }
 }
 
 impl InferenceModel {
@@ -502,9 +520,13 @@ impl InferenceModel {
         self.model_config.resolved_outputs()
     }
 
-    pub fn output_dtype(&self, output_name: &str) -> Result<crate::utils::config::InferencePrecision> {
+    pub fn output_dtype(
+        &self,
+        output_name: &str,
+    ) -> Result<crate::utils::config::InferencePrecision> {
         let outputs = self.resolved_outputs()?;
-        outputs.into_iter()
+        outputs
+            .into_iter()
             .find(|output| output.name == output_name)
             .map(|output| output.data_type)
             .context("Requested output dtype does not exist in model config")
