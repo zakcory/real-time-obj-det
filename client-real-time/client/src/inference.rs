@@ -282,7 +282,7 @@ impl InferenceModel {
         inference_request
     }
 
-    async fn infer_single_output_raw(
+    async fn infer_raw(
         client: &Client,
         mut inference_request: ModelInferRequest,
         raw_input: Vec<u8>,
@@ -323,7 +323,7 @@ impl InferenceModel {
         Ok(output_blob)
     }
 
-    async fn infer_single_output_shm(
+    async fn infer_shm(
         client: &Client,
         mut inference_request: ModelInferRequest,
         raw_input: Vec<u8>,
@@ -404,7 +404,7 @@ impl InferenceModel {
 
             let inference_request = self.build_inference_request(num_inputs);
             let output_blob = if use_shm {
-                Self::infer_single_output_shm(
+                Self::infer_shm(
                     &self.client,
                     inference_request,
                     concatenated,
@@ -412,7 +412,7 @@ impl InferenceModel {
                 )
                 .await?
             } else {
-                Self::infer_single_output_raw(
+                Self::infer_raw(
                     &self.client,
                     inference_request,
                     concatenated,
@@ -457,7 +457,7 @@ impl InferenceModel {
 
                     async move {
                         let output_blob = if use_shm {
-                            Self::infer_single_output_shm(
+                            Self::infer_shm(
                                 &client,
                                 inference_request,
                                 concatenated,
@@ -465,7 +465,7 @@ impl InferenceModel {
                             )
                             .await?
                         } else {
-                            Self::infer_single_output_raw(
+                            Self::infer_raw(
                                 &client,
                                 inference_request,
                                 concatenated,

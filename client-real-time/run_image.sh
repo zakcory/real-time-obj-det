@@ -19,8 +19,6 @@ tritonserver \
 TRITON_PID=$!
 
 cleanup() {
-    local exit_code=$?
-    trap - EXIT SIGINT SIGTERM
 
     if [[ -n "${CLIENT_PID}" ]] && kill -0 "${CLIENT_PID}" 2>/dev/null; then
         kill "${CLIENT_PID}" 2>/dev/null || true
@@ -33,10 +31,8 @@ cleanup() {
     fi
 
     echo "Cleanup complete!"
-    exit "${exit_code}"
 }
 
-trap cleanup EXIT SIGINT SIGTERM
 
 # Wait for triton server to be ready
 while true; do
@@ -59,8 +55,9 @@ done
 # Start Triton client application
 export PLAYER_BACKEND_URL="http://172.17.0.1:8702"
 export RUST_LOG=INFO
-cd /app && ./client &
+cd /app && ./client-build/target/release/client &
 CLIENT_PID=$!
 
 # Wait for cargo process to finish
+trap cleanup EXIT SIGINT SIGTERM
 wait "${CLIENT_PID}"

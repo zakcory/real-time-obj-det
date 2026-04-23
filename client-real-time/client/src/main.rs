@@ -48,5 +48,8 @@ async fn main() -> Result<()> {
         .await
         .context("Error setting Client Video callbacks")?;
 
+    // Keep main alive; Ctrl+C (SIGINT) terminates the process via the default signal handler
+    tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await;
+
     Ok(())
 }

@@ -33,7 +33,7 @@ restore_config() {
 }
 trap restore_config EXIT
 
-for end_id in 1 2 3 4 5; do
+for end_id in {1..10}; do
   ids_csv="$(seq -s ', ' 1 "${end_id}")"
   ids_line="  ids: [${ids_csv}]"
 

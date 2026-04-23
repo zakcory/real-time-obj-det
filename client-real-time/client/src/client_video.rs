@@ -8,9 +8,9 @@ use std::ffi::CString;
 use std::sync::OnceLock;
 
 // Custom modules
-use crate::source;
 use crate::utils::config::AppConfig;
 use crate::processing::{RawFrame, ResultBBOX};
+use crate::source;
 
 /// Client as static global variable
 pub static CLIENT_VIDEO: OnceLock<Arc<ClientVideo>> = OnceLock::new();
@@ -34,34 +34,46 @@ pub fn init_client_video() -> Result<()> {
 
 // C Types
 pub type SourceFramesCb = extern "C" fn(source_id: c_int, frame: *const u8, width: c_int, height: c_int, pts: c_ulonglong);
-pub type SourceStoppedCb = extern "C" fn(source_id: c_int);
-pub type SourceNameCb = extern "C" fn(source_id: c_int, source_name: *const c_char);
-pub type SourceStatusCb = extern "C" fn(source_id: c_int, source_status: c_int);
-pub type InitMultipleSourcesFn = extern "C" fn(source_ids: *const c_int, size: c_int, log_level: c_int);
+pub type SourceMetadataCb = extern "C" fn(
+    source_id: c_int,
+    width: c_int,
+    height: c_int,
+    fps: c_int,
+    source_name: *const c_char,
+);
+pub type SourceStatusCb = extern "C" fn(source_id: c_int, status: c_int);
+pub type PostResultsCb = extern "C" fn(source_id: c_int, response: *const c_char);
+pub type InitMultipleSourcesFn = extern "C" fn(source_ids: *const c_int, size: c_int);
+pub type StopMultipleSourcesFn = extern "C" fn(source_ids: *const c_int, size: c_int);
 pub type PostResultsFn = extern "C" fn(source_id: c_int, result_json: *const c_char) -> c_int;
 pub type FreeCPtrFn = extern "C" fn(ptr: *const c_void);
 pub type SetCallbacksFn = extern "C" fn(
     source_frames: SourceFramesCb,
-    source_stopped: SourceStoppedCb,
-    source_name: SourceNameCb,
-    source_status: SourceStatusCb
+    source_metadata: SourceMetadataCb,
+    source_status: SourceStatusCb,
+    post_results: PostResultsCb,
 );
 
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LogLevel {
-    Regular = 0,
-    Debug = 1,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
+    Stopped = 0,
+    Streaming = 1,
+    Initializing = 2,
+    Terminating = 3,
 }
 
-#[repr(i32)]
-#[derive(Debug, Clone, Copy)]
-pub enum SourceStatus {
-    Ok = 0,
-    NotStreaming = 1,
-    NotFound = 2,
-    ConnectionError = 3,
-    DecodeError = 4,
+impl SourceStatus {
+    pub fn as_i32(self) -> i32 { self as i32 }
+
+    fn from_i32(v: i32) -> Self {
+        match v {
+            1 => SourceStatus::Streaming,
+            2 => SourceStatus::Initializing,
+            3 => SourceStatus::Terminating,
+            _ => SourceStatus::Stopped,
+        }
+    }
 }
 
 pub struct ClientVideo {
@@ -100,9 +112,9 @@ impl ClientVideo {
 
     // Library function
     async fn set_callbacks() -> Result<()> {
-        let client_video = get_client_video()?;
-
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let client_video = get_client_video()?;
+
             unsafe {
                 let lib_set_callbacks: Symbol<SetCallbacksFn> = client_video.library()
                     .get(b"SetCallbacks")
@@ -111,9 +123,9 @@ impl ClientVideo {
 
                 lib_set_callbacks(
                     ClientVideo::_source_frames_callback,
-                    ClientVideo::_source_stopped_callback,
-                    ClientVideo::_source_name_callback,
-                    ClientVideo::_source_status_callback
+                    ClientVideo::_source_metadata_callback,
+                    ClientVideo::_source_status_callback,
+                    ClientVideo::_post_results_callback
                 )
             }
 
@@ -126,13 +138,12 @@ impl ClientVideo {
     }
 
     async fn start_sources(source_ids: Vec<c_int>) -> Result<()> {
-        let client_video = get_client_video()?;
-
         if source_ids.len() == 0 {
             anyhow::bail!("No valid sources are avaliable");
         }
 
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let client_video = get_client_video()?;
             unsafe {
                 let lib_init_multiple_sources: Symbol<InitMultipleSourcesFn> = client_video.library()
                     .get(b"InitMultipleSources")
@@ -141,8 +152,7 @@ impl ClientVideo {
 
                 lib_init_multiple_sources(
                     source_ids.as_ptr() as *const c_int, 
-                    source_ids.len() as c_int, 
-                    LogLevel::Regular as c_int
+                    source_ids.len() as c_int
                 )
             }
 
@@ -150,6 +160,35 @@ impl ClientVideo {
         }).await
             .context("Error trying to initiate sources in video client")?
             .context("Error initiating source in video client")?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn stop_sources(source_ids: Vec<c_int>) -> Result<()> {
+        if source_ids.len() == 0 {
+            anyhow::bail!("No valid sources are avaliable");
+        }
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let client_video = get_client_video()?;
+
+            unsafe {
+                let lib_stop_multiple_sources: Symbol<StopMultipleSourcesFn> = client_video.library()
+                    .get(b"StopMultipleSources")
+                    .context("Cannot get 'StopMultipleSources' function")?;
+
+
+                lib_stop_multiple_sources(
+                    source_ids.as_ptr() as *const c_int, 
+                    source_ids.len() as c_int
+                )
+            }
+
+            Ok(())
+        }).await
+            .context("Error trying to stop sources in video client")?
+            .context("Error stopping source in video client")?;
 
         Ok(())
     }
@@ -179,13 +218,14 @@ impl ClientVideo {
 
 
         // Send back to client
-        let client_video = get_client_video()?;
         let results_bboxes = CString::new(bboxes_result_json)
             .context("Error converting bboxes to C string")?;
         let results_source_id = source_id.parse::<c_int>()
             .expect("Failed to convert source id to integer");
 
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let client_video = get_client_video()?;
+
             unsafe {
                 let lib_post_results: Symbol<PostResultsFn> = client_video.library()
                     .get(b"PostResults")
@@ -258,39 +298,54 @@ impl ClientVideo {
         
 
     }
-    extern "C" fn _source_stopped_callback(source_id: c_int) {
-        tracing::info!(
-            source_id=source_id, 
-            "Source stopped!"
-        );
-    }
 
-    extern "C" fn _source_name_callback(source_id: c_int, source_name: *const c_char) {
+    extern "C" fn _source_metadata_callback(
+        source_id: c_int,
+        width: c_int,
+        height: c_int,
+        fps: c_int,
+        source_name: *const c_char
+    ) {
         let source_name = ClientVideo::get_c_string(source_name)
             .unwrap_or("UNKNOWN".to_string());
 
         tracing::info!(
             source_id=source_id, 
             source_name=source_name, 
-            "Got source name"
+            width=width,
+            height=height,
+            fps=fps,
+            "Got source metadata"
         );
     }
 
     extern "C" fn _source_status_callback(source_id: c_int, source_status: c_int) {
-        let source_status = match source_status {
-            0 => "OK - Stream is active",
-            1 => "ERROR - Not streaming",
-            2 => "ERROR - Source not found",
-            3 => "ERROR - Connection error",
-            4 => "ERROR - Decode error",
-            _ => "UNKNOWN status",
-        };
+        let source_status = SourceStatus::from_i32(source_status);
 
         tracing::info!(
-            source_id=source_id, 
-            source_status=source_status, 
+            source_id=source_id,
+            ?source_status,
             "Got source status"
         );
+    }
+
+    #[allow(unused_variables)]
+    extern "C" fn _post_results_callback(source_id: c_int, response: *const c_char) {
+        let json_response = match ClientVideo::get_c_string(response) {
+            Ok(res) => res,
+            Err(e) => {
+                return tracing::error!(
+                    source_id=source_id,
+                    error=?e,
+                    "Error parsing post results response"
+                );
+            }
+        };
+
+        // tracing::info!(
+        //     source_id=source_id,
+        //     "Got post results response"
+        // );
     }
 
     // Helper functions
@@ -309,7 +364,7 @@ impl ClientVideo {
         Ok(())
     }
 
-    fn get_c_string(ptr: *const c_char) -> Result<String> {
+    pub fn get_c_string(ptr: *const c_char) -> Result<String> {
         if ptr.is_null() {
             anyhow::bail!("C string is invalid!")
         }
@@ -331,7 +386,7 @@ impl ClientVideo {
         Ok(string)
     }
 
-    fn get_c_array<T: Clone>(ptr: *const T, len: usize) -> Result<Vec<T>> {
+    pub fn get_c_array<T: Clone>(ptr: *const T, len: usize) -> Result<Vec<T>> {
         if ptr.is_null() {
             anyhow::bail!("C list is invalid!")
         }
